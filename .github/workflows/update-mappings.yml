@@ -1,0 +1,154 @@
+name: Update & Publish Otaku Mappings DB
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      api_budget_seconds:
+        description: 'Max live API hydration seconds (0 skips live APIs)'
+        required: false
+        default: '120'
+      max_api_items:
+        description: 'Max delta shows to hydrate per run'
+        required: false
+        default: '200'
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/update-mappings.yml'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mappings-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-pipeline:
+    name: Hermetic Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Hermetic Pipeline Tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+  build-and-publish:
+    name: Build, Validate & Publish Mapping DB
+    needs: test-pipeline
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore Persistent API Hydration Cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: otaku-mappings-cache-${{ github.run_id }}
+          restore-keys: |
+            otaku-mappings-cache-
+
+      - name: Fetch Latest Seed Database (for monotone validation & legacy preservation)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p .seed
+          if gh release download latest -R "${{ github.repository }}" -p "anime_mappings.db" -D .seed 2>/dev/null; then
+            echo "Fetched seed DB from rolling 'latest' release."
+          elif [ -f anime_mappings.db ]; then
+            cp anime_mappings.db .seed/anime_mappings.db
+            echo "Using repository baseline anime_mappings.db as seed."
+          else
+            echo "No prior seed DB found; building cleanly from upstream datasets."
+          fi
+
+      - name: Build Enriched anime_mappings.db & .xz Archive
+        run: |
+          SEED_FLAG=""
+          if [ -f .seed/anime_mappings.db ]; then
+            SEED_FLAG="--seed .seed/anime_mappings.db"
+          fi
+          BUDGET="${{ github.event.inputs.api_budget_seconds || '120' }}"
+          ITEMS="${{ github.event.inputs.max_api_items || '200' }}"
+          python3 scripts/build_mappings.py \
+            $SEED_FLAG \
+            --output dist/anime_mappings.db \
+            --compress-xz \
+            --manifest dist/manifest.json \
+            --cache-dir .cache \
+            --api-budget-seconds "$BUDGET" \
+            --max-api-items "$ITEMS"
+
+      - name: Validate Database Integrity, Indexes & Monotone Coverage
+        run: |
+          BASE_FLAG=""
+          if [ -f .seed/anime_mappings.db ]; then
+            BASE_FLAG="--baseline .seed/anime_mappings.db"
+          fi
+          python3 scripts/validate_mappings.py \
+            --db dist/anime_mappings.db \
+            $BASE_FLAG \
+            --xz dist/anime_mappings.db.xz \
+            --manifest dist/manifest.json \
+            --min-rows 31000 \
+            --require-canonical-spots
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum anime_mappings.db anime_mappings.db.xz manifest.json > SHA256SUMS.txt
+          md5sum anime_mappings.db anime_mappings.db.xz manifest.json > MD5SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish Rolling 'latest' & Dated Snapshot GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE_TAG="v$(date -u +%Y.%m.%d)"
+          NOTES=$(python3 - <<'PY'
+          import json
+          m = json.load(open("dist/manifest.json"))
+          c = m["coverage"]
+          f = m["files"]
+          print(f"""## Otaku Mapping Database ({m['generated_at_utc']})
+
+- **Rows**: `{m['total_rows']:,}` (seed: `{m['seed_rows']:,}`) | **TVDB/Cour Rules**: `{m['rule_count']:,}`
+- **Archives**: `anime_mappings.db.xz` (`{f['xz']['size_bytes']:,}` bytes) | `anime_mappings.db` (`{f['raw']['size_bytes']:,}` bytes)
+- **Coverage**: `anilist_id={c['anilist_id']:,}`, `kitsu_id={c['kitsu_id']:,}`, `anidb_id={c['anidb_id']:,}`, `simkl_id={c['simkl_id']:,}`, `thetvdb_id={c['thetvdb_id']:,}`, `themoviedb_id={c['themoviedb_id']:,}`, `imdb_id={c['imdb_id']:,}`, `mal_dub_id={c['mal_dub_id']:,}`
+- **Recent (`mal_id >= 55000`, n=`{c['recent_total']:,}`)**: `thetvdb_id={c['recent_thetvdb_id']:,}`, `themoviedb_id={c['recent_themoviedb_id']:,}`, `anidb_id={c['recent_anidb_id']:,}`
+""")
+          PY
+          )
+          printf "%s\n" "$NOTES" > dist/RELEASE_NOTES.md
+
+          # Update rolling 'latest' release cleanly
+          if gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload latest dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --clobber -R "${{ github.repository }}"
+            gh release edit latest --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
+          else
+            gh release create latest dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --title "Otaku Mapping DB (Latest Automated Build)" --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
+          fi
+
+          # Publish/update dated immutable snapshot tag
+          if gh release view "$DATE_TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$DATE_TAG" dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --clobber -R "${{ github.repository }}"
+          else
+            gh release create "$DATE_TAG" dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --title "Otaku Mapping DB $DATE_TAG" --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
+          fi

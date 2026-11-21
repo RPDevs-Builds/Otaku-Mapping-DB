@@ -1,49 +1,59 @@
-# Otaku Mappings
+# Otaku Mapping DB (`RPDevs-Builds/Otaku-Mapping-DB`)
 
-Otaku Mappings is an all-in-one anime mapping database, combining multiple trusted sources into a single, comprehensive file. This project provides a centralized, easy-to-use database that connects various anime-related IDs across platforms, making cross-referencing between sources easier.
+Automated, indexed, cryptographically verified anime cross-platform mapping database forked from [Goldenfreddy0703/Otaku-Mappings](https://github.com/Goldenfreddy0703/Otaku-Mappings) for **Otaku-RPDev**.
 
-## Features
-- **Unified Database**: A single file containing mappings of IDs and data points across multiple anime platforms.
-- **Combined Sources**: Uses various sources to gather and unify data, creating more complete and versatile mappings.
-- **Versatile Mappings**: Includes a wide range of data points from IDs to media types, episode counts, and more.
-- **MAL as Unique Identifier**: Uses **MyAnimeList (MAL) IDs** as unique identifiers due to MAL’s comprehensive and well-maintained database, providing consistency across entries.
+Rather than committing static 6 MB SQLite binaries into Git history, a daily GitHub Actions pipeline (`.github/workflows/update-mappings.yml`) rebuilds, validates, indexes, compresses (`.xz` ~1.8 MB), and publishes `anime_mappings.db` cleanly to rolling `latest` and dated `vYYYY.MM.DD` GitHub Releases.
 
-## Sources
-Otaku Mappings gathers data from multiple trusted sources to ensure accuracy and comprehensiveness:
+---
 
-- [Mdblist](https://mdblist.com/)
-- [Fribb's Anime Lists](https://github.com/Fribb/anime-lists)
-- [Arm](https://github.com/kawaiioverflow/arm)
-- [Anime Offline Database](https://github.com/manami-project/anime-offline-database)
-- [Anime Lists](https://github.com/Anime-Lists/anime-lists)
-- [MAL Dubs](https://github.com/MAL-Dubs/MAL-Dubs)
+## Automated Sources & Resolution Pipeline
 
-## Mapping Information
+1. **Seed Continuity**: Preserves historical `trakt_id`, legacy curations (e.g. `thetvdb_season = 'a'`), and baseline fallback metadata while stripping dirty sentinels (`''`, non-numeric strings in `thetvdb_id`).
+2. **Manami Anime Offline Database** (`manami-project/anime-offline-database`): Base catalog (`mal_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`), canonical titles, relative MAL picture suffixes, duration (seconds), median score, status, episode counts, and franchise `relatedAnime` graph.
+3. **Fribb Anime Lists** (`Fribb/anime-lists`): Cross-references `thetvdb_id`, `themoviedb_id` (`tv` / `movie`), `imdb_id`, seasons, and episode offsets.
+4. **Anime-Lists XML** (`Anime-Lists/anime-lists`): `anidbid`-keyed TVDB/TMDB season/offset defaults and `<mapping-list>` episode split rules into `tvdb_rules`.
+5. **Kometa Anime-IDs** (`Kometa-Team/Anime-IDs`) & **MAL-Dubs** (`MAL-Dubs/MAL-Dubs`): Backfills missing TVDB/season/offset entries and `mal_dub_id`.
+6. **Incremental Cached Live API Hydration** (`actions/cache` delta-only):
+   - **AniList GraphQL** (`graphql.anilist.co` batches of 50): Fills airing/recent metadata and `PREQUEL` relation edges.
+   - **AniZip** (`api.ani.zip/mappings?mal_id=...`): Direct `thetvdb_id`, `themoviedb_id`, `imdb_id`, episode count, and `seasonNumber` for newly airing shows.
+   - **MALSync Rules** (`api.malsync.moe/tvdb/rules/cache-key/...`): Populates split-cour and `absoluteStart` episode rules into `tvdb_rules`.
+   - **Transitive Prequel Inheritance**: Propagates unambiguous franchise `thetvdb_id` / `themoviedb_id` / `imdb_id` down direct TV sequel chains.
 
-The Otaku Mappings database provides the following mappings for each entry:
+---
 
-- **mal_id**: MyAnimeList ID
-- **mal_dub_id**: MyAnimeList Dub ID
-- **anilist_id**: AniList ID
-- **kitsu_id**: Kitsu ID
-- **anidb_id**: AniDB ID
-- **simkl_id**: Simkl ID
-- **thetvdb_id**: TheTVDB ID
-- **themoviedb_id**: The Movie Database (TMDb) ID
-- **imdb_id**: IMDb ID
-- **trakt_id**: Trakt ID
-- **mal_title**: Main Title from MyAnimeList
-- **mal_picture**: Image data from MyAnimeList
-- **thetvdb_season**: Season data from TheTVDB
-- **thetvdb_part**: Part information from TheTVDB
-- **duration**: Duration per episode
-- **score**: Median Score from MyAnimeList
-- **status**: Status per anime
-- **anime_media_type**: Media type specific to anime
-- **global_media_type**: Universal media type
-- **anime_media_episodes**: Episode count specific to anime
-- **global_media_episodes**: Episode count across universal media types
+## Schema & Performance Enhancements
 
-## Note on Data Accuracy
+- **100% Backward Compatible `anime` Table**: Preserves all 21 columns (`mal_id`, `mal_dub_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_title`, `mal_picture`, `thetvdb_season`, `thetvdb_part`, `duration`, `score`, `status`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`).
+- **Zero Full-Table Scans**: Adds B-tree indexes on `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, and `mal_title`, plus `ANALYZE` statistics and `VACUUM` optimization for `file:...db?mode=ro` readers.
+- **Additive Tables**:
+  - `tvdb_rules`: Split-cour, special, and `absolute_start` episode mapping rules from `Anime-Lists` XML and `MALSync`.
+  - `build_meta`: Schema version, UTC build timestamp, row/rule totals, and JSON coverage summary.
 
-While we strive for accuracy, some data might be outdated or inaccurate due to discrepancies across sources. If you come across any inaccuracies, please [create an issue](https://github.com/Goldenfreddy0703/Otaku-Mappings/issues) on GitHub so we can investigate and correct it. Your feedback helps improve the project!
+---
+
+## Release Assets (`releases/latest`)
+
+Each scheduled run uploads:
+- `anime_mappings.db.xz` (~1.8 MB LZMA compressed)
+- `anime_mappings.db` (uncompressed SQLite DB)
+- `manifest.json` (timestamps, row counts, coverage metrics, SHA-256 digests)
+- `SHA256SUMS.txt` / `MD5SUMS.txt`
+
+Direct rolling URLs:
+- `https://github.com/RPDevs-Builds/Otaku-Mapping-DB/releases/download/latest/anime_mappings.db.xz`
+- `https://github.com/RPDevs-Builds/Otaku-Mapping-DB/releases/download/latest/manifest.json`
+
+---
+
+## Local Development & Verification
+
+```bash
+# Run hermetic offline unit tests
+python3 -m unittest discover -s tests -p "test_*.py" -v
+
+# Build locally using cached/live feeds + seed preservation
+python3 scripts/build_mappings.py --seed anime_mappings.db --output dist/anime_mappings.db --compress-xz --manifest dist/manifest.json --cache-dir .cache
+
+# Run strict integrity, index query-plan, hygiene & baseline monotone validation
+python3 scripts/validate_mappings.py --db dist/anime_mappings.db --baseline anime_mappings.db --xz dist/anime_mappings.db.xz --manifest dist/manifest.json --min-rows 31000 --require-canonical-spots
+```

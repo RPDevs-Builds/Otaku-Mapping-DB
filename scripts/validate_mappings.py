@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Strict integrity, query-plan, and monotone-coverage validator for anime_mappings.db."""
+
+import argparse
+import hashlib
+import json
+import lzma
+import os
+import re
+import sqlite3
+import sys
+
+REQUIRED_TABLES = ("anime", "activities", "tvdb_rules", "build_meta")
+REQUIRED_COLUMNS = (
+    "mal_id", "mal_dub_id", "anilist_id", "kitsu_id", "anidb_id", "simkl_id",
+    "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_title", "mal_picture",
+    "thetvdb_season", "thetvdb_part", "duration", "score", "status",
+    "anime_media_type", "global_media_type", "anime_media_episodes", "global_media_episodes",
+)
+INDEXED_LOOKUP_COLUMNS = (
+    ("mal_id", 1),
+    ("anilist_id", 1),
+    ("kitsu_id", 1),
+    ("anidb_id", 1),
+    ("simkl_id", 1),
+    ("thetvdb_id", 1),
+    ("themoviedb_id", 1),
+    ("imdb_id", "tt0000001"),
+    ("trakt_id", 1),
+    ("mal_dub_id", 1),
+    ("mal_title", "Cowboy Bebop"),
+)
+INTEGER_ID_COLS = frozenset({
+    "mal_id", "mal_dub_id", "anilist_id", "kitsu_id", "anidb_id",
+    "simkl_id", "thetvdb_id", "themoviedb_id", "trakt_id",
+})
+_RE_IMDB = re.compile(r"^tt\d{5,10}$")
+
+
+def _col_count(conn, col):
+    if col in INTEGER_ID_COLS:
+        return conn.execute(
+            f'SELECT COUNT(*) FROM anime WHERE typeof("{col}") = "integer" AND "{col}" > 0'
+        ).fetchone()[0]
+    return conn.execute(
+        f'SELECT COUNT(*) FROM anime WHERE "{col}" IS NOT NULL AND TRIM(CAST("{col}" AS TEXT)) != ""'
+    ).fetchone()[0]
+
+
+def validate_database(
+    db_path,
+    baseline_path=None,
+    xz_path=None,
+    manifest_path=None,
+    min_rows=0,
+    max_regression_ratio=0.005,
+    require_canonical_spots=False,
+):
+    """Run full schema, hygiene, query-plan, regression, and compression verification.
+
+    Returns:
+        list[str]: Empty list on success, or list of human-readable error strings.
+    """
+    errors = []
+    if not os.path.isfile(db_path):
+        return [f"Missing database file: {db_path}"]
+
+    conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
+    try:
+        for pragma_name in ("quick_check", "integrity_check"):
+            res = conn.execute(f"PRAGMA {pragma_name}").fetchone()[0]
+            if res != "ok":
+                errors.append(f"PRAGMA {pragma_name} failed: {res}")
+
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing_tables = [t for t in REQUIRED_TABLES if t not in tables]
+        if missing_tables:
+            errors.append(f"Missing required tables: {missing_tables}")
+
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(anime)")]
+        missing_cols = [c for c in REQUIRED_COLUMNS if c not in cols]
+        if missing_cols:
+            errors.append(f"Missing required anime columns: {missing_cols}")
+            return errors
+
+        total_rows = conn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
+        if total_rows < min_rows:
+            errors.append(f"Row count {total_rows} is below min_rows floor {min_rows}")
+
+        # Hygiene checks: zero empty strings in ID columns, numeric integer IDs, valid tt-prefixed IMDb IDs, valid seasons
+        for id_col in ("mal_id", "anilist_id", "kitsu_id", "anidb_id", "simkl_id", "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_dub_id"):
+            dirty_empty = conn.execute(
+                f'SELECT COUNT(*) FROM anime WHERE "{id_col}" = "" OR "{id_col}" = 0 OR "{id_col}" IN ("None", "null")'
+            ).fetchone()[0]
+            if dirty_empty:
+                errors.append(f"Column {id_col} contains {dirty_empty} empty/zero sentinel values")
+            if id_col in INTEGER_ID_COLS:
+                dirty_str = conn.execute(
+                    f'SELECT COUNT(*) FROM anime WHERE "{id_col}" IS NOT NULL AND typeof("{id_col}") != "integer"'
+                ).fetchone()[0]
+                if dirty_str:
+                    errors.append(f"Column {id_col} contains {dirty_str} non-integer values")
+
+        bad_imdb = 0
+        for (val,) in conn.execute("SELECT imdb_id FROM anime WHERE imdb_id IS NOT NULL"):
+            if not _RE_IMDB.match(str(val)):
+                bad_imdb += 1
+        if bad_imdb:
+            errors.append(f"Column imdb_id contains {bad_imdb} malformed non-ttNNNNN values")
+
+        bad_season = conn.execute(
+            "SELECT COUNT(*) FROM anime WHERE thetvdb_season IS NOT NULL AND typeof(thetvdb_season) != 'integer' AND thetvdb_season != 'a'"
+        ).fetchone()[0]
+        if bad_season:
+            errors.append(f"Column thetvdb_season contains {bad_season} invalid non-integer/non-'a' values")
+
+        # Verify query plans never degrade to SCAN anime on hot ID columns
+        for col, sample in INDEXED_LOOKUP_COLUMNS:
+            plan_rows = conn.execute(
+                f'EXPLAIN QUERY PLAN SELECT mal_id FROM anime WHERE "{col}" = ?', (sample,)
+            ).fetchall()
+            plan_txt = " | ".join(str(r[-1]) for r in plan_rows)
+            if "SCAN anime" in plan_txt:
+                errors.append(f"Missing/unused index for {col}: query plan = '{plan_txt}'")
+
+        # Baseline monotone coverage comparison
+        if baseline_path and os.path.isfile(baseline_path):
+            bconn = sqlite3.connect(f"file:{os.path.abspath(baseline_path)}?mode=ro", uri=True)
+            try:
+                base_rows = bconn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
+                if total_rows < base_rows * (1.0 - max_regression_ratio):
+                    errors.append(f"Total rows regressed from {base_rows} to {total_rows}")
+                for col in (
+                    "anilist_id", "kitsu_id", "anidb_id", "simkl_id",
+                    "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id",
+                    "mal_dub_id", "mal_title",
+                ):
+                    cur_c = _col_count(conn, col)
+                    base_c = _col_count(bconn, col)
+                    if cur_c < base_c * (1.0 - max_regression_ratio):
+                        errors.append(f"Coverage regression in '{col}': baseline={base_c}, candidate={cur_c}")
+            finally:
+                bconn.close()
+
+        # Optional live canonical spot checks (used in CI / full builds)
+        if require_canonical_spots:
+            checks = (
+                (1, {"thetvdb_id": 76885, "themoviedb_id": 30991}),
+                (21, {"thetvdb_season": "a", "thetvdb_id": 81797}),
+                (52991, {"thetvdb_id": 424536, "themoviedb_id": 209867}),
+                (58516, {"thetvdb_id": 248035, "thetvdb_season": 4}),
+                (59193, {"thetvdb_id": 371310, "themoviedb_id": 94664}),
+                (63752, {"thetvdb_id": 475631}),
+            )
+            conn.row_factory = sqlite3.Row
+            for mid, expected in checks:
+                row = conn.execute("SELECT * FROM anime WHERE mal_id=?", (mid,)).fetchone()
+                if not row:
+                    errors.append(f"Missing canonical spot-check mal_id={mid}")
+                    continue
+                for k, v in expected.items():
+                    if row[k] != v:
+                        errors.append(f"Spot check mal_id={mid} col={k}: expected {v!r}, got {row[k]!r}")
+    finally:
+        conn.close()
+
+    # Verify .xz decompression & manifest SHA-256 parity
+    if xz_path:
+        if not os.path.isfile(xz_path):
+            errors.append(f"Missing xz archive: {xz_path}")
+        else:
+            with open(db_path, "rb") as rf:
+                raw_sha = hashlib.sha256(rf.read()).hexdigest()
+            with lzma.open(xz_path, "rb") as xf:
+                decomp_sha = hashlib.sha256(xf.read()).hexdigest()
+            if decomp_sha != raw_sha:
+                errors.append(f"xz decompression SHA-256 mismatch: raw={raw_sha} vs xz={decomp_sha}")
+
+    if manifest_path:
+        if not os.path.isfile(manifest_path):
+            errors.append(f"Missing manifest: {manifest_path}")
+        else:
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                manifest = json.load(mf)
+            with open(db_path, "rb") as rf:
+                raw_sha = hashlib.sha256(rf.read()).hexdigest()
+            man_raw_sha = ((manifest.get("files") or {}).get("raw") or {}).get("sha256")
+            if man_raw_sha != raw_sha:
+                errors.append(f"Manifest raw sha256 mismatch: manifest={man_raw_sha} vs actual={raw_sha}")
+
+    return errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Validate generated anime_mappings.db")
+    parser.add_argument("--db", default="dist/anime_mappings.db", help="Candidate SQLite DB")
+    parser.add_argument("--baseline", default="", help="Optional baseline DB for monotone coverage gate")
+    parser.add_argument("--xz", default="", help="Optional compressed .xz archive to verify")
+    parser.add_argument("--manifest", default="", help="Optional manifest.json to verify")
+    parser.add_argument("--min-rows", type=int, default=30000, help="Minimum required row count")
+    parser.add_argument("--require-canonical-spots", action="store_true", help="Assert canonical anime spot checks")
+    args = parser.parse_args()
+
+    errs = validate_database(
+        args.db,
+        baseline_path=args.baseline or None,
+        xz_path=args.xz or None,
+        manifest_path=args.manifest or None,
+        min_rows=args.min_rows,
+        require_canonical_spots=args.require_canonical_spots,
+    )
+    if errs:
+        for e in errs:
+            print(f"[FAIL] {e}", file=sys.stderr)
+        return 1
+    print(f"[OK] Validated {args.db} cleanly (integrity, indexes, hygiene, baseline & archives).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

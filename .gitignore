@@ -1,0 +1,10 @@
+# Build artifacts & persistent CI hydration cache
+dist/
+.cache/
+.seed/
+__pycache__/
+*.pyc
+*.pyo
+*.candidate.db
+*.tmp
+.pytest_cache/
