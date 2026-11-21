@@ -1188,6 +1188,28 @@ def build_pipeline(args):
         with open(args.manifest, "w", encoding="utf-8") as mf:
             json.dump(manifest, mf, indent=2)
 
+    notes_path = getattr(args, "release_notes", "")
+    if notes_path:
+        ndir = os.path.dirname(os.path.abspath(notes_path))
+        if ndir:
+            os.makedirs(ndir, exist_ok=True)
+        c = manifest["coverage"]
+        xz_note = f"`anime_mappings.db.xz` (`{xz_size:,}` bytes) | " if xz_size else ""
+        notes_text = (
+            f"## Otaku Mapping Database ({manifest['generated_at_utc']})\n\n"
+            f"- **Rows**: `{manifest['total_rows']:,}` (seed: `{manifest['seed_rows']:,}`) | "
+            f"**TVDB/Cour Rules**: `{manifest['rule_count']:,}`\n"
+            f"- **Archives**: {xz_note}`anime_mappings.db` (`{raw_size:,}` bytes)\n"
+            f"- **Coverage**: `anilist_id={c['anilist_id']:,}`, `kitsu_id={c['kitsu_id']:,}`, "
+            f"`anidb_id={c['anidb_id']:,}`, `simkl_id={c['simkl_id']:,}`, `thetvdb_id={c['thetvdb_id']:,}`, "
+            f"`themoviedb_id={c['themoviedb_id']:,}`, `imdb_id={c['imdb_id']:,}`, `mal_dub_id={c['mal_dub_id']:,}`\n"
+            f"- **Recent (`mal_id >= 55000`, n=`{c['recent_total']:,}`)**: "
+            f"`thetvdb_id={c['recent_thetvdb_id']:,}`, `themoviedb_id={c['recent_themoviedb_id']:,}`, "
+            f"`anidb_id={c['recent_anidb_id']:,}`\n"
+        )
+        with open(notes_path, "w", encoding="utf-8") as nf:
+            nf.write(notes_text)
+
     print(
         f"Built {args.output}: {len(records):,} rows (+{len(records) - seed_count:,} vs seed), "
         f"{len(all_rules):,} rules, {raw_size:,} bytes"
@@ -1203,6 +1225,7 @@ def main():
     parser.add_argument("--output", default="dist/anime_mappings.db", help="Output SQLite DB path")
     parser.add_argument("--compress-xz", action="store_true", help="Also produce <output>.xz")
     parser.add_argument("--manifest", default="dist/manifest.json", help="Output JSON build manifest path")
+    parser.add_argument("--release-notes", default="", help="Optional markdown release notes output path")
     parser.add_argument("--cache-dir", default=".cache", help="Persistent cache dir for bulk & API downloads")
     parser.add_argument("--offline-fixtures", default="", help="Read deterministic JSON/XML fixtures from local dir")
     parser.add_argument("--api-budget-seconds", type=float, default=90.0, help="Max wall time for live API hydration")
