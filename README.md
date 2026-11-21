@@ -8,15 +8,17 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
 
 ## Automated Sources & Resolution Pipeline
 
-1. **Seed Continuity**: Preserves historical `trakt_id`, legacy curations (e.g. `thetvdb_season = 'a'`), and baseline fallback metadata while stripping dirty sentinels (`''`, non-numeric strings in `thetvdb_id`).
+1. **Seed Continuity & Shell Pruning**: Preserves historical `trakt_id`, legacy curations (e.g. `thetvdb_season = 'a'`), and baseline fallback metadata while stripping dirty sentinels (`''`, non-numeric strings in `thetvdb_id`) and pruning empty orphaned seed shells (`>64000` phantom IDs after deduplication).
 2. **Manami Anime Offline Database** (`manami-project/anime-offline-database`): Base catalog (`mal_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`), canonical titles, relative MAL picture suffixes, duration (seconds), median score, status, episode counts, and franchise `relatedAnime` graph.
-3. **Fribb Anime Lists** (`Fribb/anime-lists`): Cross-references `thetvdb_id`, `themoviedb_id` (`tv` / `movie`), `imdb_id`, seasons, and episode offsets.
-4. **Anime-Lists XML** (`Anime-Lists/anime-lists`): `anidbid`-keyed TVDB/TMDB season/offset defaults and `<mapping-list>` episode split rules into `tvdb_rules`.
-5. **Kometa Anime-IDs** (`Kometa-Team/Anime-IDs`) & **MAL-Dubs** (`MAL-Dubs/MAL-Dubs`): Backfills missing TVDB/season/offset entries and `mal_dub_id`.
-6. **Incremental Cached Live API Hydration** (`actions/cache` delta-only):
-   - **AniList GraphQL** (`graphql.anilist.co` batches of 50): Fills airing/recent metadata and `PREQUEL` relation edges.
+3. **kawaiioverflow/arm** (`kawaiioverflow/arm`): Additional `mal_id <-> anilist_id` cross-reference backfill prior to downstream merges.
+4. **Fribb Anime Lists** (`Fribb/anime-lists`): Cross-references `thetvdb_id`, `themoviedb_id` (`tv` / `movie`), `imdb_id`, seasons, and episode offsets.
+5. **Anime-Lists XML** (`Anime-Lists/anime-lists`): `anidbid`-keyed TVDB/TMDB season/offset defaults and `<mapping-list>` episode split rules into `tvdb_rules`.
+6. **Kometa Anime-IDs** (`Kometa-Team/Anime-IDs`), **Wikidata SPARQL** (`P4086` <-> IMDb/TVDB/TMDb), **AniDB Official Titles** (`anime-titles.xml.gz`), & **MAL-Dubs** (`MAL-Dubs/MAL-Dubs`): Backfills missing cross-platform IDs, missing titles, and `mal_dub_id`.
+7. **Incremental Cached Live API Hydration** (`actions/cache` delta-only):
+   - **AniList GraphQL** (`graphql.anilist.co` batches of 50): Fills airing/recent/untitled metadata (`format`, `status`, `title`, `episodes`) and `PREQUEL` relation edges.
    - **AniZip** (`api.ani.zip/mappings?mal_id=...`): Direct `thetvdb_id`, `themoviedb_id`, `imdb_id`, episode count, and `seasonNumber` for newly airing shows.
    - **MALSync Rules** (`api.malsync.moe/tvdb/rules/cache-key/...`): Populates split-cour and `absoluteStart` episode rules into `tvdb_rules`.
+   - **Simkl Extended API** (`api.simkl.com`): Fills remaining missing `simkl_id`, `thetvdb_id`, `themoviedb_id`, and `imdb_id` for recent/airing titles (guarded by `ids.mal == mal_id`).
    - **Transitive Prequel Inheritance**: Propagates unambiguous franchise `thetvdb_id` / `themoviedb_id` / `imdb_id` down direct TV sequel chains.
 
 ---
@@ -55,5 +57,5 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 python3 scripts/build_mappings.py --seed anime_mappings.db --output dist/anime_mappings.db --compress-xz --manifest dist/manifest.json --cache-dir .cache
 
 # Run strict integrity, index query-plan, hygiene & baseline monotone validation
-python3 scripts/validate_mappings.py --db dist/anime_mappings.db --baseline anime_mappings.db --xz dist/anime_mappings.db.xz --manifest dist/manifest.json --min-rows 31000 --require-canonical-spots
+python3 scripts/validate_mappings.py --db dist/anime_mappings.db --baseline anime_mappings.db --xz dist/anime_mappings.db.xz --manifest dist/manifest.json --min-rows 30000 --require-canonical-spots
 ```

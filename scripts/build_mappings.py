@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Otaku-Mapping-DB automated multi-source SQLite builder.
 
-Merges open anime mapping datasets (Manami Anime Offline Database, Fribb anime-lists,
-Anime-Lists XML, Kometa Anime-IDs, MAL-Dubs) with bounded cached live API hydration
-(AniList GraphQL + Prequel/Sequel inheritance, AniZip, MALSync TVDB rules, Kitsu)
-and seed database preservation to build a compact, fully indexed anime_mappings.db
-plus .xz archive and SHA-256 manifest.
+Merges open anime mapping datasets (Manami Anime Offline Database, kawaiioverflow ARM,
+Fribb anime-lists, Anime-Lists XML, Kometa Anime-IDs, Wikidata SPARQL, AniDB official
+titles XML, MAL-Dubs) with bounded cached live API hydration (AniList GraphQL +
+Prequel/Sequel inheritance, AniZip, MALSync TVDB rules, Simkl) and seed database
+preservation to build a compact, fully indexed anime_mappings.db plus .xz archive
+and SHA-256 manifest.
 """
 
 import argparse
 import collections
 import datetime
+import gzip
 import hashlib
 import json
 import lzma
@@ -20,18 +22,38 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 
 SOURCE_URLS = {
     "fribb": "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json",
     "manami": "https://github.com/manami-project/anime-offline-database/releases/latest/download/anime-offline-database-minified.json",
+    "arm": "https://raw.githubusercontent.com/kawaiioverflow/arm/master/arm.json",
     "anime_lists": "https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-master.xml",
     "mal_dubs": "https://raw.githubusercontent.com/MAL-Dubs/MAL-Dubs/main/data/dubInfo.json",
     "kometa": "https://raw.githubusercontent.com/Kometa-Team/Anime-IDs/master/anime_ids.json",
+    "anidb_titles": "https://anidb.net/api/anime-titles.xml.gz",
 }
+
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+SIMKL_CLIENT_ID = os.environ.get(
+    "SIMKL_CLIENT_ID",
+    "59dfdc579d244e1edf6f89874d521d37a69a95a1abd349910cb056a1872ba2c8",
+)
+_EXTERNAL_ID_COLS = (
+    "mal_dub_id",
+    "anilist_id",
+    "kitsu_id",
+    "anidb_id",
+    "simkl_id",
+    "thetvdb_id",
+    "themoviedb_id",
+    "imdb_id",
+    "trakt_id",
+)
 
 MAL_PICTURE_PREFIX = "https://cdn.myanimelist.net/images/anime/"
 _RE_IMDB = re.compile(r"(tt\d{5,10})")
@@ -179,7 +201,7 @@ def empty_record(mal_id):
 
 
 def _http_get_bytes(url, headers=None, timeout=30, retries=2):
-    req_headers = {"User-Agent": "Otaku-Mapping-DB-Builder/2.0"}
+    req_headers = {"User-Agent": "Otaku-Mapping-DB-Builder/2.1 (https://github.com/RPDevs-Builds/Otaku-Mapping-DB)"}
     if headers:
         req_headers.update(headers)
     last_exc = None
@@ -189,8 +211,14 @@ def _http_get_bytes(url, headers=None, timeout=30, retries=2):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read(), resp.status, dict(resp.headers)
         except urllib.error.HTTPError as exc:
-            if exc.code in (304, 404, 400):
-                return b"", exc.code, dict(exc.headers or {})
+            err_code = exc.code
+            err_hdrs = dict(exc.headers or {})
+            try:
+                exc.close()
+            except Exception:
+                pass
+            if err_code in (304, 404, 400):
+                return b"", err_code, err_hdrs
             last_exc = exc
         except Exception as exc:
             last_exc = exc
@@ -202,7 +230,7 @@ def _http_get_bytes(url, headers=None, timeout=30, retries=2):
 def _http_post_json(url, payload, timeout=20, retries=2):
     body = json.dumps(payload).encode("utf-8")
     headers = {
-        "User-Agent": "Otaku-Mapping-DB-Builder/2.0",
+        "User-Agent": "Otaku-Mapping-DB-Builder/2.1 (https://github.com/RPDevs-Builds/Otaku-Mapping-DB)",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -213,8 +241,14 @@ def _http_post_json(url, payload, timeout=20, retries=2):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                wait_s = min(5.0, float(exc.headers.get("Retry-After") or 2.0))
+            err_code = exc.code
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                exc.close()
+            except Exception:
+                pass
+            if err_code == 429:
+                wait_s = min(20.0, float(retry_after or 5.0))
                 time.sleep(wait_s)
             last_exc = exc
         except Exception as exc:
@@ -261,20 +295,30 @@ class ApiCache:
         os.replace(tmp, path)
 
 
-def load_source_blob(name, url, cache_dir=None, offline_dir=None, max_cache_age=6 * 3600):
+def load_source_blob(
+    name,
+    url,
+    cache_dir=None,
+    offline_dir=None,
+    max_cache_age=6 * 3600,
+    extra_headers=None,
+    optional=False,
+):
     """Fetch bulk source bytes from offline fixture dir, fresh local cache, or live URL."""
-    ext = ".xml" if name == "anime_lists" else ".json"
+    ext = ".xml.gz" if name == "anidb_titles" else (".xml" if name == "anime_lists" else ".json")
     if offline_dir:
-        for candidate in (f"{name}{ext}", f"{name}.json", f"{name}.xml"):
+        for candidate in (f"{name}{ext}", f"{name}.json", f"{name}.xml", f"{name}.xml.gz"):
             p = os.path.join(offline_dir, candidate)
             if os.path.isfile(p):
                 with open(p, "rb") as f:
                     return f.read()
+        if optional:
+            return None
         raise FileNotFoundError(f"Offline fixture not found for source '{name}' in {offline_dir}")
 
     meta_p = os.path.join(cache_dir, f"bulk_{name}.meta.json") if cache_dir else None
     blob_p = os.path.join(cache_dir, f"bulk_{name}{ext}") if cache_dir else None
-    headers = {}
+    headers = dict(extra_headers or {})
     if cache_dir and os.path.isfile(blob_p) and os.path.isfile(meta_p):
         try:
             with open(meta_p, "r", encoding="utf-8") as mf:
@@ -289,7 +333,18 @@ def load_source_blob(name, url, cache_dir=None, offline_dir=None, max_cache_age=
         except Exception:
             pass
 
-    raw, status, resp_headers = _http_get_bytes(url, headers=headers, timeout=60)
+    try:
+        raw, status, resp_headers = _http_get_bytes(url, headers=headers, timeout=60)
+    except Exception as exc:
+        if blob_p and os.path.isfile(blob_p):
+            print(f"[WARN] Source '{name}' fetch error ({exc}); using cached copy.", file=sys.stderr)
+            with open(blob_p, "rb") as bf:
+                return bf.read()
+        if optional:
+            print(f"[WARN] Optional source '{name}' unavailable ({exc}); skipping.", file=sys.stderr)
+            return None
+        raise
+
     if status == 304 and blob_p and os.path.isfile(blob_p):
         with open(meta_p, "r+", encoding="utf-8") as mf:
             meta = json.load(mf)
@@ -304,6 +359,9 @@ def load_source_blob(name, url, cache_dir=None, offline_dir=None, max_cache_age=
             print(f"[WARN] Source '{name}' returned HTTP {status}; using cached copy.", file=sys.stderr)
             with open(blob_p, "rb") as bf:
                 return bf.read()
+        if optional:
+            print(f"[WARN] Optional source '{name}' returned HTTP {status}; skipping.", file=sys.stderr)
+            return None
         raise RuntimeError(f"Source '{name}' failed with HTTP {status}")
 
     if cache_dir:
@@ -646,6 +704,119 @@ def merge_kometa(records, kometa_bytes, ep_counts, offsets):
                 rec["global_media_episodes"] = format_episode_range(1 + ep_off, ep_counts[mid])
 
 
+def merge_arm(records, arm_bytes):
+    """Backfill missing anilist_id on known MAL records from kawaiioverflow/arm."""
+    if not arm_bytes:
+        return 0
+    entries = json.loads(arm_bytes.decode("utf-8"))
+    filled = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        mid = parse_pos_int(entry.get("mal_id"))
+        al_id = parse_pos_int(entry.get("anilist_id"))
+        if mid and al_id and mid in records and not records[mid]["anilist_id"]:
+            records[mid]["anilist_id"] = al_id
+            filled += 1
+    return filled
+
+
+def merge_wikidata(records, wd_bytes):
+    """Ingest Wikidata SPARQL results (P4086 MAL <-> P345 IMDb / P4835 TVDB / P4983-P4947 TMDB)."""
+    if not wd_bytes:
+        return 0
+    payload = json.loads(wd_bytes.decode("utf-8"))
+    bindings = ((payload or {}).get("results") or {}).get("bindings") or ()
+    filled = 0
+    for row in bindings:
+        if not isinstance(row, dict):
+            continue
+        mid = parse_pos_int((row.get("mal") or {}).get("value"))
+        if not mid or mid not in records:
+            continue
+        rec = records[mid]
+
+        tvdb_id = parse_pos_int((row.get("tvdb") or {}).get("value"))
+        if tvdb_id and not rec["thetvdb_id"]:
+            rec["thetvdb_id"] = tvdb_id
+            filled += 1
+
+        tmdb_tv = parse_pos_int((row.get("tmdbTv") or {}).get("value"))
+        tmdb_mv = parse_pos_int((row.get("tmdbMovie") or {}).get("value"))
+        if tmdb_tv and not rec["themoviedb_id"] and rec.get("anime_media_type") != "MOVIE":
+            rec["themoviedb_id"] = tmdb_tv
+            if not rec["global_media_type"]:
+                rec["global_media_type"] = "show"
+            filled += 1
+        elif tmdb_mv and not rec["themoviedb_id"]:
+            rec["themoviedb_id"] = tmdb_mv
+            if not rec["global_media_type"]:
+                rec["global_media_type"] = "movie"
+            filled += 1
+        elif tmdb_tv and not rec["themoviedb_id"]:
+            rec["themoviedb_id"] = tmdb_tv
+            filled += 1
+
+        imdb = clean_imdb_id((row.get("imdb") or {}).get("value"))
+        if imdb and not rec["imdb_id"]:
+            rec["imdb_id"] = imdb
+            filled += 1
+    return filled
+
+
+def merge_anidb_titles(records, raw_bytes):
+    """Backfill missing mal_title via AniDB official anime-titles.xml(.gz) dump."""
+    if not raw_bytes:
+        return 0
+    if raw_bytes[:2] == b"\x1f\x8b":
+        raw_bytes = gzip.decompress(raw_bytes)
+
+    by_anidb = collections.defaultdict(list)
+    for mid, rec in records.items():
+        aid = rec.get("anidb_id")
+        if aid and not rec.get("mal_title"):
+            by_anidb[aid].append(mid)
+    if not by_anidb:
+        return 0
+
+    xml_lang_key = "{http://www.w3.org/XML/1998/namespace}lang"
+    root = ET.fromstring(raw_bytes.decode("utf-8"))
+    filled = 0
+    for anime_el in root.findall("anime"):
+        aid = parse_pos_int(anime_el.attrib.get("aid"))
+        if not aid or aid not in by_anidb:
+            continue
+        best_rank = 99
+        best_title = None
+        for t_el in anime_el.findall("title"):
+            text = (t_el.text or "").strip()
+            if not text:
+                continue
+            ttype = (t_el.attrib.get("type") or "").strip().lower()
+            lang = (t_el.attrib.get(xml_lang_key) or "").strip().lower()
+            if ttype == "main":
+                rank = 0
+            elif ttype == "official" and lang == "x-jat":
+                rank = 1
+            elif ttype == "official" and lang == "en":
+                rank = 2
+            elif ttype == "official":
+                rank = 3
+            elif ttype == "syn" and lang in ("x-jat", "en"):
+                rank = 4
+            else:
+                continue
+            if rank < best_rank:
+                best_rank = rank
+                best_title = text
+        if best_title:
+            for mid in by_anidb[aid]:
+                if not records[mid]["mal_title"]:
+                    records[mid]["mal_title"] = best_title
+                    filled += 1
+    return filled
+
+
 def merge_mal_dubs(records, dubs_bytes):
     """Populate mal_dub_id from MAL-Dubs dubbed list."""
     payload = json.loads(dubs_bytes.decode("utf-8"))
@@ -666,18 +837,27 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
             _apply_anilist_media(records, media_list, ep_counts, prequel_edges)
         return prequel_edges
 
-    # Prioritize TV/ONA rows missing thetvdb_id/themoviedb_id/anilist_id or ONGOING/UPCOMING
+    # Prioritize missing-title/status rows, recent IDs (>= 55000), and TV/ONA/OVA/MOVIE missing IDs
     candidates = [
         mid for mid, r in records.items()
         if (
-            r.get("anime_media_type") in ("TV", "ONA", "OVA", "MOVIE", None)
-            and (
-                r.get("status") in ("ONGOING", "UPCOMING", None)
-                or (mid >= 50000 and (not r.get("thetvdb_id") or not r.get("themoviedb_id") or not r.get("mal_title")))
+            not r.get("mal_title")
+            or not r.get("status")
+            or (
+                r.get("anime_media_type") in ("TV", "ONA", "OVA", "MOVIE", None)
+                and (
+                    r.get("status") in ("ONGOING", "UPCOMING")
+                    or (mid >= 50000 and (not r.get("thetvdb_id") or not r.get("themoviedb_id")))
+                )
             )
         )
     ]
-    candidates.sort(reverse=True)
+    candidates.sort(
+        key=lambda m: (
+            0 if (m >= 55000 or not records[m].get("mal_title")) else 1,
+            -m,
+        )
+    )
 
     query = """query ($ids: [Int]) {
   Page(perPage: 50) {
@@ -699,7 +879,7 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
             to_fetch.append(mid)
 
     batch_size = 50
-    for idx in range(0, min(len(to_fetch), 1000), batch_size):
+    for idx in range(0, min(len(to_fetch), 4000), batch_size):
         if deadline and time.time() >= deadline:
             break
         chunk = to_fetch[idx:idx + batch_size]
@@ -716,7 +896,7 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
                 if mid not in seen_batch:
                     cache.set("anilist", mid, {})
             _apply_anilist_media(records, media, ep_counts, prequel_edges)
-            time.sleep(0.75)
+            time.sleep(2.05)
         except Exception as exc:
             print(f"[WARN] AniList batch skipped: {exc}", file=sys.stderr)
             break
@@ -726,6 +906,7 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
 
 def _apply_anilist_media(records, media_list, ep_counts, prequel_edges):
     status_map = {"RELEASING": "ONGOING", "NOT_YET_RELEASED": "UPCOMING", "FINISHED": "FINISHED", "CANCELLED": "FINISHED"}
+    fmt_map = {"TV": "TV", "TV_SHORT": "TV", "ONA": "ONA", "OVA": "OVA", "MOVIE": "MOVIE", "SPECIAL": "SPECIAL", "MUSIC": "SPECIAL"}
     for m in media_list:
         if not isinstance(m, dict):
             continue
@@ -743,6 +924,14 @@ def _apply_anilist_media(records, media_list, ep_counts, prequel_edges):
                 rec["mal_title"] = t
         if not rec["status"] and m.get("status") in status_map:
             rec["status"] = status_map[m["status"]]
+        fmt = fmt_map.get(str(m.get("format") or "").upper())
+        if fmt and not rec["anime_media_type"]:
+            rec["anime_media_type"] = fmt
+            if not rec["global_media_type"]:
+                if fmt == "MOVIE":
+                    rec["global_media_type"] = "movie"
+                elif fmt in ("TV", "ONA"):
+                    rec["global_media_type"] = "show"
         if not rec["duration"]:
             dur_min = parse_pos_int(m.get("duration"))
             if dur_min:
@@ -763,8 +952,87 @@ def _apply_anilist_media(records, media_list, ep_counts, prequel_edges):
                     prequel_edges[mid].append(pre_mal)
 
 
-def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=None, max_items=150, deadline=0.0):
-    """Hydrate missing TVDB/TMDB/IMDb/season and cour rules via AniZip & MALSync rules."""
+def _fetch_simkl_record(mal_id, existing_simkl_id=None):
+    """Fetch Simkl /anime/{id}?extended=full payload using existing simkl_id or /search/id?mal=."""
+    if not SIMKL_CLIENT_ID:
+        return {}
+    simkl_id = parse_pos_int(existing_simkl_id)
+    if not simkl_id:
+        raw, status, _ = _http_get_bytes(
+            f"https://api.simkl.com/search/id?mal={mal_id}&client_id={urllib.parse.quote(SIMKL_CLIENT_ID)}",
+            timeout=12,
+            retries=1,
+        )
+        if status == 200 and raw:
+            arr = json.loads(raw.decode("utf-8"))
+            if isinstance(arr, list):
+                for item in arr:
+                    if not isinstance(item, dict):
+                        continue
+                    ids = item.get("ids") or {}
+                    item_mal = parse_pos_int(ids.get("mal"))
+                    if item_mal is not None and item_mal != mal_id:
+                        continue
+                    cand_sk = parse_pos_int(ids.get("simkl") or ids.get("simkl_id"))
+                    if cand_sk:
+                        simkl_id = cand_sk
+                        break
+        time.sleep(0.15)
+    if not simkl_id:
+        return {}
+    raw, status, _ = _http_get_bytes(
+        f"https://api.simkl.com/anime/{simkl_id}?extended=full&client_id={urllib.parse.quote(SIMKL_CLIENT_ID)}",
+        timeout=12,
+        retries=1,
+    )
+    if status == 200 and raw:
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _apply_simkl(records, mal_id, sk, ep_counts):
+    """Apply Simkl extended metadata carefully when Simkl MAL ID matches mal_id."""
+    rec = records.get(mal_id)
+    if not rec or not isinstance(sk, dict):
+        return
+    ids = sk.get("ids") if isinstance(sk.get("ids"), dict) else sk
+    sk_mal = parse_pos_int(ids.get("mal"))
+    if sk_mal is not None and sk_mal != mal_id:
+        return
+
+    for src_k, col in (
+        ("simkl", "simkl_id"),
+        ("simkl_id", "simkl_id"),
+        ("anilist", "anilist_id"),
+        ("kitsu", "kitsu_id"),
+        ("anidb", "anidb_id"),
+        ("tvdb", "thetvdb_id"),
+        ("tmdb", "themoviedb_id"),
+    ):
+        val = parse_pos_int(ids.get(src_k))
+        if val and not rec[col]:
+            rec[col] = val
+
+    imdb = clean_imdb_id(ids.get("imdb"))
+    if imdb and not rec["imdb_id"]:
+        rec["imdb_id"] = imdb
+
+    if not rec["mal_title"]:
+        title = (sk.get("title") or "").strip()
+        if title:
+            rec["mal_title"] = title
+
+    tot_eps = parse_pos_int(sk.get("total_episodes"))
+    if tot_eps and mal_id not in ep_counts:
+        ep_counts[mal_id] = tot_eps
+        rec["anime_media_episodes"] = format_episode_range(1, tot_eps)
+        if not rec["global_media_episodes"]:
+            rec["global_media_episodes"] = format_episode_range(1, tot_eps)
+
+
+def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=None, max_items=350, deadline=0.0):
+    """Hydrate missing TVDB/TMDB/IMDb/Simkl/season and cour rules via AniZip, MALSync, & Simkl."""
     extra_rules = []
     if offline_dir:
         az_fix = os.path.join(offline_dir, "anizip_items.json")
@@ -777,6 +1045,11 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
             with open(ms_fix, "r", encoding="utf-8") as f:
                 for mid_s, ms_data in json.load(f).items():
                     extra_rules.extend(_apply_malsync_rules(records, int(mid_s), ms_data))
+        sk_fix = os.path.join(offline_dir, "simkl_items.json")
+        if os.path.isfile(sk_fix):
+            with open(sk_fix, "r", encoding="utf-8") as f:
+                for mid_s, sk_data in json.load(f).items():
+                    _apply_simkl(records, int(mid_s), sk_data, ep_counts)
         return extra_rules
 
     priority_ids = [
@@ -787,6 +1060,7 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
                 not r.get("thetvdb_id")
                 or not r.get("themoviedb_id")
                 or not r.get("imdb_id")
+                or not r.get("simkl_id")
                 or r.get("status") in ("ONGOING", "UPCOMING")
             )
             and (mid >= 55000 or r.get("status") in ("ONGOING", "UPCOMING"))
@@ -829,6 +1103,26 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
                     ms = {}
             if isinstance(ms, dict) and ms:
                 extra_rules.extend(_apply_malsync_rules(records, mid, ms))
+
+        # 3. Simkl fallback when TVDB/TMDB/IMDb/Simkl ID still missing
+        if deadline and time.time() >= deadline:
+            break
+        if SIMKL_CLIENT_ID and (
+            not rec.get("thetvdb_id")
+            or not rec.get("themoviedb_id")
+            or not rec.get("imdb_id")
+            or not rec.get("simkl_id")
+        ):
+            sk = cache.get("simkl", mid, max_age_seconds=ttl)
+            if sk is None:
+                try:
+                    sk = _fetch_simkl_record(mid, rec.get("simkl_id"))
+                    cache.set("simkl", mid, sk)
+                    time.sleep(0.2)
+                except Exception:
+                    sk = {}
+            if isinstance(sk, dict) and sk:
+                _apply_simkl(records, mid, sk, ep_counts)
 
     return extra_rules
 
@@ -950,8 +1244,13 @@ def apply_prequel_inheritance(records, prequel_edges, manami_related):
             break
 
 
-def finalize_parts_and_uniqueness(records):
-    """Compute missing thetvdb_part ordinals cleanly and enforce SQLite UNIQUE columns."""
+def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None):
+    """Compute missing thetvdb_part ordinals, enforce SQLite UNIQUE cols, and prune empty/synthetic shells.
+
+    Returns:
+        int: Count of empty orphan or stale synthetic (>64000 non-Manami with zero external IDs)
+            records pruned after uniqueness deduplication.
+    """
     groups = collections.defaultdict(list)
     for mid, rec in records.items():
         if rec["thetvdb_id"] and rec["thetvdb_season"] is not None:
@@ -986,6 +1285,20 @@ def finalize_parts_and_uniqueness(records):
                 rec[col] = None
             else:
                 seen[col].add(val)
+
+    # Prune empty orphan rows and stale synthetic (>64000 non-Manami) rows left with zero external IDs
+    _ = seed_ids  # retained for explicit caller diagnostics
+    pruned = 0
+    for mid in list(records.keys()):
+        rec = records[mid]
+        if any(rec.get(c) is not None for c in _EXTERNAL_ID_COLS):
+            continue
+        is_empty_shell = rec.get("mal_title") is None and rec.get("status") is None
+        is_stale_synthetic = mid > 64000 and (canonical_mal_ids is None or mid not in canonical_mal_ids)
+        if is_empty_shell or is_stale_synthetic:
+            del records[mid]
+            pruned += 1
+    return pruned
 
 
 def write_sqlite_database(output_path, records, rules, stats):
@@ -1101,11 +1414,25 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def _build_wikidata_url():
+    sparql = (
+        "SELECT ?mal ?imdb ?tvdb ?tmdbTv ?tmdbMovie WHERE { "
+        "?item wdt:P4086 ?mal . "
+        "{ ?item wdt:P345 ?imdb . } UNION "
+        "{ ?item wdt:P4835 ?tvdb . } UNION "
+        "{ ?item wdt:P4983 ?tmdbTv . } UNION "
+        "{ ?item wdt:P4947 ?tmdbMovie . } "
+        "}"
+    )
+    return f"{WIKIDATA_SPARQL_URL}?{urllib.parse.urlencode({'query': sparql, 'format': 'json'})}"
+
+
 def build_pipeline(args):
     t0 = time.perf_counter()
     cache = ApiCache(args.cache_dir)
 
     records = load_seed_database(args.seed)
+    seed_ids = set(records.keys())
     seed_count = len(records)
     ep_counts = {}
     for mid, r in records.items():
@@ -1115,15 +1442,29 @@ def build_pipeline(args):
 
     manami_bytes = load_source_blob("manami", SOURCE_URLS["manami"], args.cache_dir, args.offline_fixtures)
     fribb_bytes = load_source_blob("fribb", SOURCE_URLS["fribb"], args.cache_dir, args.offline_fixtures)
+    arm_bytes = load_source_blob("arm", SOURCE_URLS["arm"], args.cache_dir, args.offline_fixtures, optional=True)
     xml_bytes = load_source_blob("anime_lists", SOURCE_URLS["anime_lists"], args.cache_dir, args.offline_fixtures)
     kometa_bytes = load_source_blob("kometa", SOURCE_URLS["kometa"], args.cache_dir, args.offline_fixtures)
     dubs_bytes = load_source_blob("mal_dubs", SOURCE_URLS["mal_dubs"], args.cache_dir, args.offline_fixtures)
+    anidb_titles_bytes = load_source_blob(
+        "anidb_titles", SOURCE_URLS["anidb_titles"], args.cache_dir, args.offline_fixtures,
+        max_cache_age=24 * 3600, optional=True,
+    )
+    wikidata_bytes = load_source_blob(
+        "wikidata", _build_wikidata_url(), args.cache_dir, args.offline_fixtures,
+        max_cache_age=24 * 3600,
+        extra_headers={"Accept": "application/sparql-results+json"},
+        optional=True,
+    )
 
-    manami_related, manami_eps, _ = merge_manami(records, manami_bytes)
+    manami_related, manami_eps, manami_mal_ids = merge_manami(records, manami_bytes)
     ep_counts.update(manami_eps)
     offsets = merge_fribb(records, fribb_bytes, ep_counts)
+    merge_arm(records, arm_bytes)
     xml_rules = merge_anime_lists_xml(records, xml_bytes, ep_counts, offsets)
     merge_kometa(records, kometa_bytes, ep_counts, offsets)
+    merge_wikidata(records, wikidata_bytes)
+    merge_anidb_titles(records, anidb_titles_bytes)
     merge_mal_dubs(records, dubs_bytes)
 
     extra_rules = []
@@ -1136,7 +1477,7 @@ def build_pipeline(args):
         )
 
     apply_prequel_inheritance(records, prequel_edges, manami_related)
-    finalize_parts_and_uniqueness(records)
+    pruned_shells = finalize_parts_and_uniqueness(records, seed_ids=seed_ids, canonical_mal_ids=manami_mal_ids)
 
     all_rules = xml_rules + extra_rules
     stats = compute_stats(records)
@@ -1163,6 +1504,7 @@ def build_pipeline(args):
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "seed_rows": seed_count,
+        "pruned_seed_shells": pruned_shells,
         "total_rows": len(records),
         "rule_count": len(all_rules),
         "build_seconds": round(time.perf_counter() - t0, 2),
@@ -1211,8 +1553,8 @@ def build_pipeline(args):
             nf.write(notes_text)
 
     print(
-        f"Built {args.output}: {len(records):,} rows (+{len(records) - seed_count:,} vs seed), "
-        f"{len(all_rules):,} rules, {raw_size:,} bytes"
+        f"Built {args.output}: {len(records):,} rows ({len(records) - seed_count:+,} vs seed, "
+        f"pruned {pruned_shells} empty shells), {len(all_rules):,} rules, {raw_size:,} bytes"
         + (f", xz={xz_size:,} bytes" if xz_size else "")
         + f" in {manifest['build_seconds']}s"
     )
@@ -1228,8 +1570,8 @@ def main():
     parser.add_argument("--release-notes", default="", help="Optional markdown release notes output path")
     parser.add_argument("--cache-dir", default=".cache", help="Persistent cache dir for bulk & API downloads")
     parser.add_argument("--offline-fixtures", default="", help="Read deterministic JSON/XML fixtures from local dir")
-    parser.add_argument("--api-budget-seconds", type=float, default=90.0, help="Max wall time for live API hydration")
-    parser.add_argument("--max-api-items", type=int, default=150, help="Max delta shows hydrated per run")
+    parser.add_argument("--api-budget-seconds", type=float, default=180.0, help="Max wall time for live API hydration")
+    parser.add_argument("--max-api-items", type=int, default=350, help="Max delta shows hydrated per run")
     args = parser.parse_args()
     build_pipeline(args)
     return 0

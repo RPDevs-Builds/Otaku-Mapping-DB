@@ -8,11 +8,11 @@ on:
       api_budget_seconds:
         description: 'Max live API hydration seconds (0 skips live APIs)'
         required: false
-        default: '120'
+        default: '180'
       max_api_items:
         description: 'Max delta shows to hydrate per run'
         required: false
-        default: '200'
+        default: '350'
   push:
     branches:
       - main
@@ -85,8 +85,8 @@ jobs:
           if [ -f .seed/anime_mappings.db ]; then
             SEED_FLAG="--seed .seed/anime_mappings.db"
           fi
-          BUDGET="${{ github.event.inputs.api_budget_seconds || '120' }}"
-          ITEMS="${{ github.event.inputs.max_api_items || '200' }}"
+          BUDGET="${{ github.event.inputs.api_budget_seconds || '180' }}"
+          ITEMS="${{ github.event.inputs.max_api_items || '350' }}"
           python3 scripts/build_mappings.py \
             $SEED_FLAG \
             --output dist/anime_mappings.db \
@@ -108,7 +108,7 @@ jobs:
             $BASE_FLAG \
             --xz dist/anime_mappings.db.xz \
             --manifest dist/manifest.json \
-            --min-rows 31000 \
+            --min-rows 30000 \
             --require-canonical-spots
 
       - name: Generate Checksums

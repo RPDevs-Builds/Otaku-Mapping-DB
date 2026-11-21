@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hermetic offline unit tests for Otaku-Mapping-DB builder and validator."""
 
+import gzip
 import json
 import os
 import sqlite3
@@ -35,6 +36,11 @@ class TestMappingsPipeline(unittest.TestCase):
             "INSERT INTO anime (mal_id, anilist_id, thetvdb_id, themoviedb_id, imdb_id, trakt_id, mal_title, "
             "thetvdb_season, anime_media_type, global_media_type, anime_media_episodes, global_media_episodes) "
             "VALUES (21, 21, 81797, 37854, '', 37696, 'One Piece', 'a', 'TV', 'show', '1 - 1100', '1 - 1100')"
+        )
+        # Seed synthetic orphan shell whose duplicate anilist_id (101) gets claimed by real mal_id=100 and must be pruned
+        conn.execute(
+            "INSERT INTO anime (mal_id, anilist_id, anime_media_type) "
+            "VALUES (66863, 101, 'TV')"
         )
         conn.commit()
         conn.close()
@@ -82,6 +88,15 @@ class TestMappingsPipeline(unittest.TestCase):
                     "episodes": 13,
                     "status": "ONGOING",
                 },
+                {
+                    "sources": [
+                        "https://myanimelist.net/anime/500",
+                    ],
+                    "title": "Simkl Hydrated Show",
+                    "type": "TV",
+                    "episodes": 12,
+                    "status": "FINISHED",
+                },
             ]
         }
         with open(os.path.join(fdir, "manami.json"), "w", encoding="utf-8") as f:
@@ -106,9 +121,42 @@ class TestMappingsPipeline(unittest.TestCase):
                 "episode_offset": 12,
                 "season": {"tvdb": 1},
             },
+            {
+                "type": "TV",
+                "mal_id": 400,
+                "anidb_id": 402,
+            },
         ]
         with open(os.path.join(fdir, "fribb.json"), "w", encoding="utf-8") as f:
             json.dump(fribb, f)
+
+        with open(os.path.join(fdir, "arm.json"), "w", encoding="utf-8") as f:
+            json.dump([{"mal_id": 400, "anilist_id": 401, "annict_id": 1, "syobocal_tid": 2}], f)
+
+        wikidata = {
+            "results": {
+                "bindings": [
+                    {
+                        "mal": {"type": "literal", "value": "400"},
+                        "imdb": {"type": "literal", "value": "tt9998887"},
+                        "tvdb": {"type": "literal", "value": "444001"},
+                        "tmdbTv": {"type": "literal", "value": "555001"},
+                    }
+                ]
+            }
+        }
+        with open(os.path.join(fdir, "wikidata.json"), "w", encoding="utf-8") as f:
+            json.dump(wikidata, f)
+
+        anidb_xml = """<?xml version="1.0" encoding="utf-8"?>
+<animetitles>
+  <anime aid="402">
+    <title xml:lang="en" type="official">AniDB Restored Official EN</title>
+    <title xml:lang="x-jat" type="main">AniDB Restored Main</title>
+  </anime>
+</animetitles>""".encode("utf-8")
+        with open(os.path.join(fdir, "anidb_titles.xml.gz"), "wb") as f:
+            f.write(gzip.compress(anidb_xml))
 
         xml_str = """<?xml version="1.0" encoding="utf-8"?>
 <anime-list>
@@ -163,6 +211,26 @@ class TestMappingsPipeline(unittest.TestCase):
         with open(os.path.join(fdir, "malsync_rules.json"), "w", encoding="utf-8") as f:
             json.dump(malsync_rules, f)
 
+        simkl_items = {
+            "500": {
+                "title": "Simkl Hydrated Show",
+                "total_episodes": 12,
+                "ids": {
+                    "mal": "500",
+                    "simkl": 504,
+                    "tvdb": "666001",
+                    "tmdb": "777002",
+                    "imdb": "tt5000500",
+                },
+            },
+            "300": {
+                "title": "Wrong Show Guard",
+                "ids": {"mal": "99999", "simkl": 999, "tvdb": "111", "imdb": "tt0000111"},
+            },
+        }
+        with open(os.path.join(fdir, "simkl_items.json"), "w", encoding="utf-8") as f:
+            json.dump(simkl_items, f)
+
     def test_hermetic_build_inheritance_indexes_and_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             seed_p = os.path.join(tmp, "seed.db")
@@ -185,7 +253,8 @@ class TestMappingsPipeline(unittest.TestCase):
                 max_api_items=10,
             )
             manifest = build_mappings.build_pipeline(ns)
-            self.assertEqual(manifest["total_rows"], 4)  # seed 21 + 100, 200, 300
+            self.assertEqual(manifest["pruned_seed_shells"], 1)
+            self.assertEqual(manifest["total_rows"], 6)  # seed 21 + 100, 200, 300, 400, 500 (66863 pruned)
             self.assertGreaterEqual(manifest["rule_count"], 2)
 
             errs = validate_mappings.validate_database(
@@ -193,18 +262,19 @@ class TestMappingsPipeline(unittest.TestCase):
                 baseline_path=seed_p,
                 xz_path=f"{out_db}.xz",
                 manifest_path=manifest_p,
-                min_rows=4,
+                min_rows=6,
             )
             self.assertEqual(errs, [], f"Validation unexpectedly failed: {errs}")
 
             conn = sqlite3.connect(out_db)
             conn.row_factory = sqlite3.Row
             try:
-                # 1. Seed trakt_id preserved & dirty '' imdb_id cleaned to NULL
+                # 1. Seed trakt_id preserved & dirty '' imdb_id cleaned to NULL; phantom shell 66863 pruned
                 r21 = conn.execute("SELECT * FROM anime WHERE mal_id=21").fetchone()
                 self.assertEqual(r21["trakt_id"], 37696)
                 self.assertIsNone(r21["imdb_id"])
                 self.assertEqual(r21["thetvdb_season"], "a")
+                self.assertIsNone(conn.execute("SELECT mal_id FROM anime WHERE mal_id=66863").fetchone())
 
                 # 2. Manami picture stripped to relative suffix + score rounded + dub populated
                 r100 = conn.execute("SELECT * FROM anime WHERE mal_id=100").fetchone()
@@ -224,8 +294,25 @@ class TestMappingsPipeline(unittest.TestCase):
                 r300 = conn.execute("SELECT * FROM anime WHERE mal_id=300").fetchone()
                 self.assertEqual(r300["global_media_episodes"], "13 - 25")
                 self.assertIsNone(r300["anilist_id"])  # 201 already owned by 200
+                self.assertIsNone(r300["simkl_id"])  # mismatched Simkl mal=99999 rejected
 
-                # 5. tvdb_rules table populated from both XML mapping-list & MALSync rules
+                # 5. ARM + Wikidata + AniDB titles backfill for mal_id=400
+                r400 = conn.execute("SELECT * FROM anime WHERE mal_id=400").fetchone()
+                self.assertEqual(r400["anilist_id"], 401)
+                self.assertEqual(r400["thetvdb_id"], 444001)
+                self.assertEqual(r400["themoviedb_id"], 555001)
+                self.assertEqual(r400["imdb_id"], "tt9998887")
+                self.assertEqual(r400["global_media_type"], "show")
+                self.assertEqual(r400["mal_title"], "AniDB Restored Main")
+
+                # 6. Simkl extended hydration for mal_id=500
+                r500 = conn.execute("SELECT * FROM anime WHERE mal_id=500").fetchone()
+                self.assertEqual(r500["simkl_id"], 504)
+                self.assertEqual(r500["thetvdb_id"], 666001)
+                self.assertEqual(r500["themoviedb_id"], 777002)
+                self.assertEqual(r500["imdb_id"], "tt5000500")
+
+                # 7. tvdb_rules table populated from both XML mapping-list & MALSync rules
                 rules = conn.execute("SELECT * FROM tvdb_rules ORDER BY mal_id, rule_type").fetchall()
                 sources = {r["source"] for r in rules}
                 self.assertIn("anime_lists_xml", sources)
@@ -249,6 +336,7 @@ class TestMappingsPipeline(unittest.TestCase):
             conn.execute("CREATE TABLE tvdb_rules (mal_id INTEGER, tvdb_id INTEGER, season INTEGER, rule_type TEXT, range_start INTEGER, range_end INTEGER, ep_start INTEGER, absolute_start INTEGER, source TEXT)")
             conn.execute("CREATE TABLE build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.execute("INSERT INTO anime (mal_id, thetvdb_id, imdb_id) VALUES (1, 'movie', 'bad_imdb')")
+            conn.execute("INSERT INTO anime (mal_id) VALUES (66863)")
             conn.commit()
             conn.close()
 
@@ -256,6 +344,7 @@ class TestMappingsPipeline(unittest.TestCase):
             joined = "\n".join(errs)
             self.assertIn("thetvdb_id contains 1 non-integer", joined)
             self.assertIn("malformed non-ttNNNNN", joined)
+            self.assertIn("empty orphan rows", joined)
             self.assertIn("Missing/unused index for themoviedb_id", joined)
 
 

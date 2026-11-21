@@ -114,6 +114,15 @@ def validate_database(
         if bad_season:
             errors.append(f"Column thetvdb_season contains {bad_season} invalid non-integer/non-'a' values")
 
+        empty_shells = conn.execute(
+            "SELECT COUNT(*) FROM anime WHERE mal_title IS NULL AND status IS NULL "
+            "AND mal_dub_id IS NULL AND anilist_id IS NULL AND kitsu_id IS NULL "
+            "AND anidb_id IS NULL AND simkl_id IS NULL AND thetvdb_id IS NULL "
+            "AND themoviedb_id IS NULL AND imdb_id IS NULL AND trakt_id IS NULL"
+        ).fetchone()[0]
+        if empty_shells:
+            errors.append(f"Database contains {empty_shells} empty orphan rows with no title, status, or external IDs")
+
         # Verify query plans never degrade to SCAN anime on hot ID columns
         for col, sample in INDEXED_LOOKUP_COLUMNS:
             plan_rows = conn.execute(
@@ -123,11 +132,17 @@ def validate_database(
             if "SCAN anime" in plan_txt:
                 errors.append(f"Missing/unused index for {col}: query plan = '{plan_txt}'")
 
-        # Baseline monotone coverage comparison
+        # Baseline monotone coverage comparison (ignoring empty phantom seed shells > 64000)
         if baseline_path and os.path.isfile(baseline_path):
             bconn = sqlite3.connect(f"file:{os.path.abspath(baseline_path)}?mode=ro", uri=True)
             try:
-                base_rows = bconn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
+                base_rows = bconn.execute(
+                    "SELECT COUNT(*) FROM anime WHERE "
+                    "mal_title IS NOT NULL OR status IS NOT NULL OR mal_id <= 64000 "
+                    "OR mal_dub_id IS NOT NULL OR anilist_id IS NOT NULL OR kitsu_id IS NOT NULL "
+                    "OR anidb_id IS NOT NULL OR simkl_id IS NOT NULL OR thetvdb_id IS NOT NULL "
+                    "OR themoviedb_id IS NOT NULL OR imdb_id IS NOT NULL OR trakt_id IS NOT NULL"
+                ).fetchone()[0]
                 if total_rows < base_rows * (1.0 - max_regression_ratio):
                     errors.append(f"Total rows regressed from {base_rows} to {total_rows}")
                 for col in (
