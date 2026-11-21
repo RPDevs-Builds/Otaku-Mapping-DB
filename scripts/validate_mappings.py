@@ -10,7 +10,7 @@ import re
 import sqlite3
 import sys
 
-REQUIRED_TABLES = ("anime", "activities", "tvdb_rules", "build_meta")
+REQUIRED_TABLES = ("anime", "activities", "tvdb_rules", "anime_aliases", "franchise_links", "schedule_ids", "build_meta")
 REQUIRED_COLUMNS = (
     "mal_id", "mal_dub_id", "anilist_id", "kitsu_id", "anidb_id", "simkl_id",
     "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_title", "mal_picture",
@@ -131,6 +131,50 @@ def validate_database(
             plan_txt = " | ".join(str(r[-1]) for r in plan_rows)
             if "SCAN anime" in plan_txt:
                 errors.append(f"Missing/unused index for {col}: query plan = '{plan_txt}'")
+
+        idx_names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+
+        # Verify v2.2 relational index existence, query plan, & zero dangling foreign IDs
+        if "anime_aliases" in tables:
+            if "ix_aliases_title" not in idx_names:
+                errors.append("Missing required index 'ix_aliases_title' on anime_aliases")
+            for sql, arg, label in (
+                ("EXPLAIN QUERY PLAN SELECT title FROM anime_aliases WHERE mal_id = ?", 1, "anime_aliases.mal_id"),
+                ("EXPLAIN QUERY PLAN SELECT mal_id FROM anime_aliases WHERE title = ?", "Cowboy Bebop", "anime_aliases.title"),
+            ):
+                p_txt = " | ".join(str(r[-1]) for r in conn.execute(sql, (arg,)).fetchall())
+                if "SCAN anime_aliases" in p_txt and "USING " not in p_txt:
+                    errors.append(f"Missing/unused index for {label}: query plan = '{p_txt}'")
+            dangling_al = conn.execute(
+                "SELECT COUNT(*) FROM anime_aliases a WHERE NOT EXISTS (SELECT 1 FROM anime m WHERE m.mal_id = a.mal_id)"
+            ).fetchone()[0]
+            if dangling_al:
+                errors.append(f"anime_aliases contains {dangling_al} dangling mal_id references")
+
+        if "franchise_links" in tables:
+            if "ix_franchise_rel" not in idx_names:
+                errors.append("Missing required index 'ix_franchise_rel' on franchise_links")
+            for sql, arg, label in (
+                ("EXPLAIN QUERY PLAN SELECT related_mal_id FROM franchise_links WHERE mal_id = ?", 1, "franchise_links.mal_id"),
+                ("EXPLAIN QUERY PLAN SELECT mal_id FROM franchise_links WHERE related_mal_id = ?", 1, "franchise_links.related_mal_id"),
+            ):
+                p_txt = " | ".join(str(r[-1]) for r in conn.execute(sql, (arg,)).fetchall())
+                if "SCAN franchise_links" in p_txt and "USING " not in p_txt:
+                    errors.append(f"Missing/unused index for {label}: query plan = '{p_txt}'")
+            dangling_fr = conn.execute(
+                "SELECT COUNT(*) FROM franchise_links fl "
+                "WHERE NOT EXISTS (SELECT 1 FROM anime m1 WHERE m1.mal_id = fl.mal_id) "
+                "OR NOT EXISTS (SELECT 1 FROM anime m2 WHERE m2.mal_id = fl.related_mal_id)"
+            ).fetchone()[0]
+            if dangling_fr:
+                errors.append(f"franchise_links contains {dangling_fr} dangling mal_id references")
+
+        if "schedule_ids" in tables:
+            dangling_sc = conn.execute(
+                "SELECT COUNT(*) FROM schedule_ids s WHERE NOT EXISTS (SELECT 1 FROM anime m WHERE m.mal_id = s.mal_id)"
+            ).fetchone()[0]
+            if dangling_sc:
+                errors.append(f"schedule_ids contains {dangling_sc} dangling mal_id references")
 
         # Baseline monotone coverage comparison (ignoring empty phantom seed shells > 64000)
         if baseline_path and os.path.isfile(baseline_path):

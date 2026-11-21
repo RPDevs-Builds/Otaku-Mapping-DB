@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "2.2"
 
 SOURCE_URLS = {
     "fribb": "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json",
@@ -43,6 +43,7 @@ SIMKL_CLIENT_ID = os.environ.get(
     "SIMKL_CLIENT_ID",
     "59dfdc579d244e1edf6f89874d521d37a69a95a1abd349910cb056a1872ba2c8",
 )
+TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "").strip()
 _EXTERNAL_ID_COLS = (
     "mal_dub_id",
     "anilist_id",
@@ -102,7 +103,36 @@ INDEXED_STATEMENTS = (
     'CREATE INDEX IF NOT EXISTS ix_mal_title ON "anime" (mal_title) WHERE mal_title IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_tvdb_rules_mal ON "tvdb_rules" (mal_id)',
     'CREATE INDEX IF NOT EXISTS ix_tvdb_rules_tvdb ON "tvdb_rules" (tvdb_id) WHERE tvdb_id IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS ix_aliases_title ON "anime_aliases" (title)',
+    'CREATE INDEX IF NOT EXISTS ix_franchise_rel ON "franchise_links" (related_mal_id)',
 )
+
+_RE_WS = re.compile(r"\s+")
+_RE_LATIN = re.compile(r"[A-Za-z0-9]")
+_ALIAS_PRIORITY = {"main": 0, "official": 1, "english": 1, "romaji": 1, "syn": 2, "short": 3}
+
+
+def _norm_alias(title):
+    if not title:
+        return ""
+    return _RE_WS.sub(" ", str(title).lower()).strip()
+
+
+def _add_alias(aliases_map, mal_id, title, source, lang="und", title_type="syn"):
+    """Register deduplicated searchable Latin/English/Romaji alternate title for *mal_id*."""
+    if aliases_map is None or not title:
+        return
+    clean = str(title).strip()
+    if len(clean) < 2 or len(clean) > 120 or not _RE_LATIN.search(clean):
+        return
+    norm = _norm_alias(clean)
+    if not norm:
+        return
+    key = (int(mal_id), norm)
+    prio = _ALIAS_PRIORITY.get(title_type, 5)
+    existing = aliases_map.get(key)
+    if existing is None or prio < _ALIAS_PRIORITY.get(existing[1], 5):
+        aliases_map[key] = (clean, title_type or "syn")
 
 
 def parse_pos_int(val):
@@ -421,7 +451,7 @@ def _extract_id(regex, sources):
     return None
 
 
-def merge_manami(records, manami_bytes):
+def merge_manami(records, manami_bytes, aliases_map=None):
     """Ingest Manami anime-offline-database JSON; return (related_mal_graph, ep_counts, manami_mal_ids)."""
     payload = json.loads(manami_bytes.decode("utf-8"))
     entries = payload.get("data", payload) if isinstance(payload, dict) else payload
@@ -452,6 +482,9 @@ def merge_manami(records, manami_bytes):
         title = (entry.get("title") or "").strip()
         if title:
             rec["mal_title"] = title
+            _add_alias(aliases_map, mal_id, title, "manami", lang="x-jat", title_type="main")
+        for syn in (entry.get("synonyms") or ())[:5]:
+            _add_alias(aliases_map, mal_id, syn, "manami", lang="und", title_type="syn")
 
         pic = normalize_picture(entry.get("picture"))
         if pic:
@@ -704,8 +737,8 @@ def merge_kometa(records, kometa_bytes, ep_counts, offsets):
                 rec["global_media_episodes"] = format_episode_range(1 + ep_off, ep_counts[mid])
 
 
-def merge_arm(records, arm_bytes):
-    """Backfill missing anilist_id on known MAL records from kawaiioverflow/arm."""
+def merge_arm(records, arm_bytes, schedule_ids=None):
+    """Backfill missing anilist_id and collect syobocal/annict schedule IDs from kawaiioverflow/arm."""
     if not arm_bytes:
         return 0
     entries = json.loads(arm_bytes.decode("utf-8"))
@@ -714,10 +747,18 @@ def merge_arm(records, arm_bytes):
         if not isinstance(entry, dict):
             continue
         mid = parse_pos_int(entry.get("mal_id"))
+        if not mid or mid not in records:
+            continue
         al_id = parse_pos_int(entry.get("anilist_id"))
-        if mid and al_id and mid in records and not records[mid]["anilist_id"]:
+        if al_id and not records[mid]["anilist_id"]:
             records[mid]["anilist_id"] = al_id
             filled += 1
+        if schedule_ids is not None:
+            syo = parse_pos_int(entry.get("syobocal_tid"))
+            ann = parse_pos_int(entry.get("annict_id"))
+            if syo or ann:
+                prev_syo, prev_ann = schedule_ids.get(mid, (None, None))
+                schedule_ids[mid] = (syo or prev_syo, ann or prev_ann)
     return filled
 
 
@@ -764,30 +805,32 @@ def merge_wikidata(records, wd_bytes):
     return filled
 
 
-def merge_anidb_titles(records, raw_bytes):
-    """Backfill missing mal_title via AniDB official anime-titles.xml(.gz) dump."""
+def merge_anidb_titles(records, raw_bytes, aliases_map=None):
+    """Backfill missing mal_title and collect multi-language aliases via AniDB anime-titles.xml(.gz)."""
     if not raw_bytes:
         return 0
     if raw_bytes[:2] == b"\x1f\x8b":
         raw_bytes = gzip.decompress(raw_bytes)
 
-    by_anidb = collections.defaultdict(list)
+    all_anidb = collections.defaultdict(list)
     for mid, rec in records.items():
         aid = rec.get("anidb_id")
-        if aid and not rec.get("mal_title"):
-            by_anidb[aid].append(mid)
-    if not by_anidb:
+        if aid and (not rec.get("mal_title") or aliases_map is not None):
+            all_anidb[aid].append(mid)
+    if not all_anidb:
         return 0
 
     xml_lang_key = "{http://www.w3.org/XML/1998/namespace}lang"
     root = ET.fromstring(raw_bytes.decode("utf-8"))
     filled = 0
+    allowed_langs = ("x-jat", "en", "ja")
     for anime_el in root.findall("anime"):
         aid = parse_pos_int(anime_el.attrib.get("aid"))
-        if not aid or aid not in by_anidb:
+        if not aid or aid not in all_anidb:
             continue
         best_rank = 99
         best_title = None
+        alias_candidates = []
         for t_el in anime_el.findall("title"):
             text = (t_el.text or "").strip()
             if not text:
@@ -804,16 +847,27 @@ def merge_anidb_titles(records, raw_bytes):
                 rank = 3
             elif ttype == "syn" and lang in ("x-jat", "en"):
                 rank = 4
+            elif ttype == "short" and lang in ("x-jat", "en"):
+                rank = 5
             else:
                 continue
             if rank < best_rank:
                 best_rank = rank
                 best_title = text
+            if aliases_map is not None and lang in allowed_langs and ttype in ("main", "official", "syn", "short"):
+                alias_candidates.append((rank, text, lang, ttype))
+
+        mids = all_anidb[aid]
         if best_title:
-            for mid in by_anidb[aid]:
+            for mid in mids:
                 if not records[mid]["mal_title"]:
                     records[mid]["mal_title"] = best_title
                     filled += 1
+        if aliases_map is not None and alias_candidates:
+            alias_candidates.sort(key=lambda x: x[0])
+            for _, text, lang, ttype in alias_candidates[:6]:
+                for mid in mids:
+                    _add_alias(aliases_map, mid, text, "anidb", lang=lang, title_type=ttype)
     return filled
 
 
@@ -826,15 +880,18 @@ def merge_mal_dubs(records, dubs_bytes):
             records[mid]["mal_dub_id"] = mid
 
 
-def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=None, deadline=0.0):
-    """Batch query AniList GraphQL (50 MAL IDs/req) for missing metadata & PREQUEL relation graph."""
+def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=None, deadline=0.0, franchise_links=None, aliases_map=None):
+    """Batch query AniList GraphQL (50 MAL IDs/req) for missing metadata & full relation graph."""
     prequel_edges = collections.defaultdict(list)
     if offline_dir:
         fix = os.path.join(offline_dir, "anilist_batch.json")
         if os.path.isfile(fix):
             with open(fix, "r", encoding="utf-8") as f:
                 media_list = json.load(f)
-            _apply_anilist_media(records, media_list, ep_counts, prequel_edges)
+            _apply_anilist_media(
+                records, media_list, ep_counts, prequel_edges,
+                franchise_links=franchise_links, aliases_map=aliases_map,
+            )
         return prequel_edges
 
     # Prioritize missing-title/status rows, recent IDs (>= 55000), and TV/ONA/OVA/MOVIE missing IDs
@@ -863,7 +920,8 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
   Page(perPage: 50) {
     media(idMal_in: $ids, type: ANIME) {
       id idMal status episodes duration format
-      title { romaji userPreferred }
+      title { romaji english userPreferred }
+      synonyms
       relations { edges { relationType node { id idMal format } } }
     }
   }
@@ -874,7 +932,10 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
         ttl = 86400 if records[mid].get("status") in ("ONGOING", "UPCOMING", None) else 14 * 86400
         cached = cache.get("anilist", mid, max_age_seconds=ttl)
         if cached is not None:
-            _apply_anilist_media(records, [cached], ep_counts, prequel_edges)
+            _apply_anilist_media(
+                records, [cached], ep_counts, prequel_edges,
+                franchise_links=franchise_links, aliases_map=aliases_map,
+            )
         else:
             to_fetch.append(mid)
 
@@ -895,7 +956,10 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
             for mid in chunk:
                 if mid not in seen_batch:
                     cache.set("anilist", mid, {})
-            _apply_anilist_media(records, media, ep_counts, prequel_edges)
+            _apply_anilist_media(
+                records, media, ep_counts, prequel_edges,
+                franchise_links=franchise_links, aliases_map=aliases_map,
+            )
             time.sleep(2.05)
         except Exception as exc:
             print(f"[WARN] AniList batch skipped: {exc}", file=sys.stderr)
@@ -904,7 +968,10 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
     return prequel_edges
 
 
-def _apply_anilist_media(records, media_list, ep_counts, prequel_edges):
+_CAPTURED_RELATIONS = frozenset({"PREQUEL", "SEQUEL", "SIDE_STORY", "SPIN_OFF", "PARENT", "ALTERNATIVE", "SUMMARY"})
+
+
+def _apply_anilist_media(records, media_list, ep_counts, prequel_edges, franchise_links=None, aliases_map=None):
     status_map = {"RELEASING": "ONGOING", "NOT_YET_RELEASED": "UPCOMING", "FINISHED": "FINISHED", "CANCELLED": "FINISHED"}
     fmt_map = {"TV": "TV", "TV_SHORT": "TV", "ONA": "ONA", "OVA": "OVA", "MOVIE": "MOVIE", "SPECIAL": "SPECIAL", "MUSIC": "SPECIAL"}
     for m in media_list:
@@ -917,11 +984,16 @@ def _apply_anilist_media(records, media_list, ep_counts, prequel_edges):
         al_id = parse_pos_int(m.get("id"))
         if al_id and not rec["anilist_id"]:
             rec["anilist_id"] = al_id
+        title_obj = m.get("title") or {}
         if not rec["mal_title"]:
-            title_obj = m.get("title") or {}
-            t = (title_obj.get("userPreferred") or title_obj.get("romaji") or "").strip()
+            t = (title_obj.get("userPreferred") or title_obj.get("romaji") or title_obj.get("english") or "").strip()
             if t:
                 rec["mal_title"] = t
+        if aliases_map is not None:
+            for tk, lang, ttype in (("romaji", "x-jat", "romaji"), ("english", "en", "english"), ("userPreferred", "und", "main")):
+                _add_alias(aliases_map, mid, title_obj.get(tk), "anilist", lang=lang, title_type=ttype)
+            for syn in (m.get("synonyms") or ())[:4]:
+                _add_alias(aliases_map, mid, syn, "anilist", lang="und", title_type="syn")
         if not rec["status"] and m.get("status") in status_map:
             rec["status"] = status_map[m["status"]]
         fmt = fmt_map.get(str(m.get("format") or "").upper())
@@ -944,12 +1016,71 @@ def _apply_anilist_media(records, media_list, ep_counts, prequel_edges):
                 rec["global_media_episodes"] = format_episode_range(1, eps)
 
         for edge in ((m.get("relations") or {}).get("edges") or []):
-            if edge.get("relationType") == "PREQUEL":
-                node = edge.get("node") or {}
-                pre_mal = parse_pos_int(node.get("idMal"))
-                fmt = str(node.get("format") or "").upper()
-                if pre_mal and fmt in ("TV", "ONA", "TV_SHORT"):
-                    prequel_edges[mid].append(pre_mal)
+            rel_type = str(edge.get("relationType") or "").upper()
+            node = edge.get("node") or {}
+            rel_mal = parse_pos_int(node.get("idMal"))
+            nfmt = str(node.get("format") or "").upper()
+            if rel_type == "PREQUEL" and rel_mal and nfmt in ("TV", "ONA", "TV_SHORT"):
+                prequel_edges[mid].append(rel_mal)
+            if franchise_links is not None and rel_mal and rel_mal != mid and rel_type in _CAPTURED_RELATIONS:
+                franchise_links[(mid, rel_mal, rel_type)] = "anilist"
+
+
+def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100, deadline=0.0):
+    """Optionally backfill missing trakt_id via TRAKT_CLIENT_ID IMDb/TMDb public search."""
+    if offline_dir:
+        tk_fix = os.path.join(offline_dir, "trakt_items.json")
+        if os.path.isfile(tk_fix):
+            with open(tk_fix, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for mid_s, val in data.items():
+                    mid = parse_pos_int(mid_s)
+                    tid = parse_pos_int(val.get("trakt_id") if isinstance(val, dict) else val)
+                    if mid and tid and mid in records and not records[mid]["trakt_id"]:
+                        records[mid]["trakt_id"] = tid
+        return
+
+    if not TRAKT_CLIENT_ID:
+        return
+
+    candidates = [
+        mid for mid, r in records.items()
+        if not r.get("trakt_id") and (r.get("imdb_id") or r.get("themoviedb_id"))
+    ]
+    candidates.sort(reverse=True)
+    headers = {
+        "Content-Type": "application/json",
+        "trakt-api-version": "2",
+        "trakt-api-key": TRAKT_CLIENT_ID,
+    }
+    for mid in candidates[:max_items]:
+        if deadline and time.time() >= deadline:
+            break
+        rec = records[mid]
+        tid = cache.get("trakt", mid, max_age_seconds=30 * 86400)
+        if tid is None:
+            tid = 0
+            try:
+                imdb = rec.get("imdb_id")
+                url = (
+                    f"https://api.trakt.tv/search/imdb/{urllib.parse.quote(imdb)}?type=show,movie"
+                    if imdb
+                    else f"https://api.trakt.tv/search/tmdb/{rec['themoviedb_id']}?type={'movie' if rec.get('global_media_type') == 'movie' else 'show'}"
+                )
+                raw, status, _ = _http_get_bytes(url, headers=headers, timeout=10, retries=1)
+                if status == 200 and raw:
+                    arr = json.loads(raw.decode("utf-8"))
+                    if isinstance(arr, list) and arr:
+                        entry = arr[0]
+                        obj = entry.get("show") or entry.get("movie") or {}
+                        tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
+                cache.set("trakt", mid, tid)
+                time.sleep(0.2)
+            except Exception:
+                cache.set("trakt", mid, 0)
+        if parse_pos_int(tid) and not rec["trakt_id"]:
+            rec["trakt_id"] = int(tid)
 
 
 def _fetch_simkl_record(mal_id, existing_simkl_id=None):
@@ -1301,7 +1432,7 @@ def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None
     return pruned
 
 
-def write_sqlite_database(output_path, records, rules, stats):
+def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, franchise_links=None, schedule_ids=None):
     """Write normalized anime_mappings.db, build indexes, run ANALYZE + VACUUM."""
     out_dir = os.path.dirname(os.path.abspath(output_path))
     if out_dir:
@@ -1334,6 +1465,21 @@ def write_sqlite_database(output_path, records, rules, stats):
             "ep_start INTEGER NOT NULL, absolute_start INTEGER, source TEXT NOT NULL, "
             "PRIMARY KEY (mal_id, season, rule_type, range_start, ep_start))"
         )
+        conn.execute(
+            "CREATE TABLE anime_aliases ("
+            "mal_id INTEGER NOT NULL, title TEXT NOT NULL COLLATE NOCASE, "
+            "PRIMARY KEY (mal_id, title)) WITHOUT ROWID"
+        )
+        conn.execute(
+            "CREATE TABLE franchise_links ("
+            "mal_id INTEGER NOT NULL, related_mal_id INTEGER NOT NULL, "
+            "relation_type TEXT NOT NULL, source TEXT NOT NULL, "
+            "PRIMARY KEY (mal_id, related_mal_id, relation_type)) WITHOUT ROWID"
+        )
+        conn.execute(
+            "CREATE TABLE schedule_ids ("
+            "mal_id INTEGER PRIMARY KEY, syobocal_tid INTEGER, annict_id INTEGER)"
+        )
         conn.execute("CREATE TABLE build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
         placeholders = ", ".join("?" for _ in REQUIRED_COLUMNS)
@@ -1348,6 +1494,8 @@ def write_sqlite_database(output_path, records, rules, stats):
 
         dedup_rules = {}
         for rl in rules:
+            if rl["mal_id"] not in records:
+                continue
             key = (rl["mal_id"], rl["season"], rl["rule_type"], rl["range_start"], rl["ep_start"])
             if key not in dedup_rules:
                 dedup_rules[key] = rl
@@ -1363,11 +1511,47 @@ def write_sqlite_database(output_path, records, rules, stats):
             ],
         )
 
+        alias_rows = [
+            (mid, val[0])
+            for (mid, _norm), val in sorted((aliases_map or {}).items())
+            if mid in records
+        ]
+        if alias_rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO anime_aliases (mal_id, title) VALUES (?, ?)",
+                alias_rows,
+            )
+
+        link_rows = [
+            (mid, rel_mid, rtype, src)
+            for (mid, rel_mid, rtype), src in sorted((franchise_links or {}).items())
+            if mid in records and rel_mid in records and mid != rel_mid
+        ]
+        if link_rows:
+            conn.executemany(
+                "INSERT INTO franchise_links (mal_id, related_mal_id, relation_type, source) VALUES (?, ?, ?, ?)",
+                link_rows,
+            )
+
+        sched_rows = [
+            (mid, syo, ann)
+            for mid, (syo, ann) in sorted((schedule_ids or {}).items())
+            if mid in records and (syo or ann)
+        ]
+        if sched_rows:
+            conn.executemany(
+                "INSERT INTO schedule_ids (mal_id, syobocal_tid, annict_id) VALUES (?, ?, ?)",
+                sched_rows,
+            )
+
         meta_rows = [
             ("schema_version", SCHEMA_VERSION),
             ("built_at_utc", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
             ("row_count", str(len(records))),
             ("rule_count", str(len(dedup_rules))),
+            ("alias_count", str(len(alias_rows))),
+            ("franchise_link_count", str(len(link_rows))),
+            ("schedule_id_count", str(len(sched_rows))),
             ("coverage_json", json.dumps(stats)),
         ]
         conn.executemany("INSERT INTO build_meta (key, value) VALUES (?, ?)", meta_rows)
@@ -1457,31 +1641,85 @@ def build_pipeline(args):
         optional=True,
     )
 
-    manami_related, manami_eps, manami_mal_ids = merge_manami(records, manami_bytes)
+    aliases_map = {}
+    franchise_links = {}
+    schedule_ids = {}
+
+    manami_related, manami_eps, manami_mal_ids = merge_manami(records, manami_bytes, aliases_map=aliases_map)
     ep_counts.update(manami_eps)
     offsets = merge_fribb(records, fribb_bytes, ep_counts)
-    merge_arm(records, arm_bytes)
+    merge_arm(records, arm_bytes, schedule_ids=schedule_ids)
     xml_rules = merge_anime_lists_xml(records, xml_bytes, ep_counts, offsets)
     merge_kometa(records, kometa_bytes, ep_counts, offsets)
     merge_wikidata(records, wikidata_bytes)
-    merge_anidb_titles(records, anidb_titles_bytes)
+    merge_anidb_titles(records, anidb_titles_bytes, aliases_map=aliases_map)
     merge_mal_dubs(records, dubs_bytes)
 
     extra_rules = []
     prequel_edges = {}
     if args.api_budget_seconds > 0 or args.offline_fixtures:
         wall_deadline = time.time() + args.api_budget_seconds if not args.offline_fixtures else 0.0
-        prequel_edges = hydrate_anilist_relations(records, cache, ep_counts, args.offline_fixtures, deadline=wall_deadline)
+        prequel_edges = hydrate_anilist_relations(
+            records, cache, ep_counts, args.offline_fixtures,
+            deadline=wall_deadline, franchise_links=franchise_links, aliases_map=aliases_map,
+        )
         extra_rules = hydrate_anizip_and_malsync(
             records, cache, ep_counts, args.offline_fixtures, max_items=args.max_api_items, deadline=wall_deadline
+        )
+        hydrate_trakt_ids(
+            records, cache, args.offline_fixtures,
+            max_items=min(100, args.max_api_items), deadline=wall_deadline,
         )
 
     apply_prequel_inheritance(records, prequel_edges, manami_related)
     pruned_shells = finalize_parts_and_uniqueness(records, seed_ids=seed_ids, canonical_mal_ids=manami_mal_ids)
 
+    # Filter alternate aliases (skip canonical mal_title already stored on anime.mal_title, max 3 alternates per show)
+    per_show_aliases = collections.defaultdict(list)
+    primary_norms = {mid: _norm_alias(rec.get("mal_title")) for mid, rec in records.items()}
+    for (mid, norm), (clean_t, ttype) in aliases_map.items():
+        if mid not in records or norm == primary_norms.get(mid):
+            continue
+        per_show_aliases[mid].append((_ALIAS_PRIORITY.get(ttype, 5), norm, clean_t, ttype))
+    slim_aliases = {}
+    for mid, items in per_show_aliases.items():
+        items.sort(key=lambda x: (x[0], len(x[2])))
+        for _, norm, clean_t, ttype in items[:3]:
+            slim_aliases[(mid, norm)] = (clean_t, ttype)
+    aliases_map = slim_aliases
+
+    # Add symmetric inverse PREQUEL <-> SEQUEL edges + Manami RELATED fallback
+    explicit_pairs = set()
+    inv_additions = {}
+    for (mid, rel_mid, rtype), src in franchise_links.items():
+        if mid not in records or rel_mid not in records or mid == rel_mid:
+            continue
+        explicit_pairs.add((mid, rel_mid))
+        if rtype == "PREQUEL":
+            inv_additions.setdefault((rel_mid, mid, "SEQUEL"), f"{src}_inv")
+        elif rtype == "SEQUEL":
+            inv_additions.setdefault((rel_mid, mid, "PREQUEL"), f"{src}_inv")
+    for k, v in inv_additions.items():
+        franchise_links.setdefault(k, v)
+        explicit_pairs.add((k[0], k[1]))
+    for mid, rels in manami_related.items():
+        if mid not in records:
+            continue
+        for rel_mid in rels:
+            if rel_mid in records and rel_mid != mid and (mid, rel_mid) not in explicit_pairs:
+                franchise_links.setdefault((mid, rel_mid, "RELATED"), "manami")
+
+    # Trim collections to surviving records for exact manifest counts
+    aliases_map = {k: v for k, v in aliases_map.items() if k[0] in records}
+    franchise_links = {k: v for k, v in franchise_links.items() if k[0] in records and k[1] in records and k[0] != k[1]}
+    schedule_ids = {k: v for k, v in schedule_ids.items() if k in records and (v[0] or v[1])}
+
     all_rules = xml_rules + extra_rules
     stats = compute_stats(records)
-    write_sqlite_database(args.output, records, all_rules, stats)
+    write_sqlite_database(
+        args.output, records, all_rules, stats,
+        aliases_map=aliases_map, franchise_links=franchise_links, schedule_ids=schedule_ids,
+    )
 
     raw_size = os.path.getsize(args.output)
     raw_sha = sha256_file(args.output)
@@ -1507,6 +1745,9 @@ def build_pipeline(args):
         "pruned_seed_shells": pruned_shells,
         "total_rows": len(records),
         "rule_count": len(all_rules),
+        "alias_count": len(aliases_map),
+        "franchise_link_count": len(franchise_links),
+        "schedule_id_count": len(schedule_ids),
         "build_seconds": round(time.perf_counter() - t0, 2),
         "files": {
             "raw": {
@@ -1540,11 +1781,14 @@ def build_pipeline(args):
         notes_text = (
             f"## Otaku Mapping Database ({manifest['generated_at_utc']})\n\n"
             f"- **Rows**: `{manifest['total_rows']:,}` (seed: `{manifest['seed_rows']:,}`) | "
-            f"**TVDB/Cour Rules**: `{manifest['rule_count']:,}`\n"
+            f"**TVDB/Cour Rules**: `{manifest['rule_count']:,}` | "
+            f"**Aliases**: `{manifest['alias_count']:,}` | "
+            f"**Franchise Links**: `{manifest['franchise_link_count']:,}` | "
+            f"**Schedule IDs**: `{manifest['schedule_id_count']:,}`\n"
             f"- **Archives**: {xz_note}`anime_mappings.db` (`{raw_size:,}` bytes)\n"
             f"- **Coverage**: `anilist_id={c['anilist_id']:,}`, `kitsu_id={c['kitsu_id']:,}`, "
             f"`anidb_id={c['anidb_id']:,}`, `simkl_id={c['simkl_id']:,}`, `thetvdb_id={c['thetvdb_id']:,}`, "
-            f"`themoviedb_id={c['themoviedb_id']:,}`, `imdb_id={c['imdb_id']:,}`, `mal_dub_id={c['mal_dub_id']:,}`\n"
+            f"`themoviedb_id={c['themoviedb_id']:,}`, `imdb_id={c['imdb_id']:,}`, `trakt_id={c['trakt_id']:,}`, `mal_dub_id={c['mal_dub_id']:,}`\n"
             f"- **Recent (`mal_id >= 55000`, n=`{c['recent_total']:,}`)**: "
             f"`thetvdb_id={c['recent_thetvdb_id']:,}`, `themoviedb_id={c['recent_themoviedb_id']:,}`, "
             f"`anidb_id={c['recent_anidb_id']:,}`\n"

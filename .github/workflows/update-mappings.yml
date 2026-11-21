@@ -80,6 +80,8 @@ jobs:
           fi
 
       - name: Build Enriched anime_mappings.db & .xz Archive
+        env:
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
         run: |
           SEED_FLAG=""
           if [ -f .seed/anime_mappings.db ]; then

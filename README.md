@@ -29,7 +29,10 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
 - **Zero Full-Table Scans**: Adds B-tree indexes on `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, and `mal_title`, plus `ANALYZE` statistics and `VACUUM` optimization for `file:...db?mode=ro` readers.
 - **Additive Tables**:
   - `tvdb_rules`: Split-cour, special, and `absolute_start` episode mapping rules from `Anime-Lists` XML and `MALSync`.
-  - `build_meta`: Schema version, UTC build timestamp, row/rule totals, and JSON coverage summary.
+  - `anime_aliases`: Compact `WITHOUT ROWID` indexed multi-language alternate titles (`Manami` synonyms, `AniDB` `x-jat`/`en`/`short`, `AniList` English/Romaji/synonyms) for instant offline search and scraper matching (`ix_aliases_title`).
+  - `franchise_links`: Compact `WITHOUT ROWID` bidirectional franchise graph (`PREQUEL`, `SEQUEL`, `SIDE_STORY`, `SPIN_OFF`, `PARENT`, `ALTERNATIVE`, `SUMMARY`, `RELATED`) for chronological season/sequel navigation (`ix_franchise_rel`).
+  - `schedule_ids`: `syobocal_tid` & `annict_id` Japanese broadcast schedule cross-references from `kawaiioverflow/arm`.
+  - `build_meta`: Schema version, UTC build timestamp, row/rule/alias/franchise totals, and JSON coverage summary.
 
 ---
 

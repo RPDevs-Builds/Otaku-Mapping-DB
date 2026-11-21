@@ -231,6 +231,9 @@ class TestMappingsPipeline(unittest.TestCase):
         with open(os.path.join(fdir, "simkl_items.json"), "w", encoding="utf-8") as f:
             json.dump(simkl_items, f)
 
+        with open(os.path.join(fdir, "trakt_items.json"), "w", encoding="utf-8") as f:
+            json.dump({"500": {"trakt_id": 99500}}, f)
+
     def test_hermetic_build_inheritance_indexes_and_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             seed_p = os.path.join(tmp, "seed.db")
@@ -256,6 +259,9 @@ class TestMappingsPipeline(unittest.TestCase):
             self.assertEqual(manifest["pruned_seed_shells"], 1)
             self.assertEqual(manifest["total_rows"], 6)  # seed 21 + 100, 200, 300, 400, 500 (66863 pruned)
             self.assertGreaterEqual(manifest["rule_count"], 2)
+            self.assertGreaterEqual(manifest["alias_count"], 1)
+            self.assertGreaterEqual(manifest["franchise_link_count"], 2)
+            self.assertEqual(manifest["schedule_id_count"], 1)
 
             errs = validate_mappings.validate_database(
                 out_db,
@@ -283,12 +289,17 @@ class TestMappingsPipeline(unittest.TestCase):
                 self.assertEqual(r100["mal_dub_id"], 100)
                 self.assertEqual(r100["thetvdb_id"], 777001)
 
-                # 3. Direct AniList PREQUEL inheritance populated mal_id=200 from 100
+                # 3. Direct AniList PREQUEL inheritance populated mal_id=200 from 100 + symmetric SEQUEL link
                 r200 = conn.execute("SELECT * FROM anime WHERE mal_id=200").fetchone()
                 self.assertEqual(r200["thetvdb_id"], 777001)
                 self.assertEqual(r200["themoviedb_id"], 888001)
                 self.assertEqual(r200["imdb_id"], "tt1234567")
                 self.assertEqual(r200["thetvdb_season"], 2)
+
+                links_200 = {(r["related_mal_id"], r["relation_type"]) for r in conn.execute("SELECT * FROM franchise_links WHERE mal_id=200")}
+                self.assertIn((100, "PREQUEL"), links_200)
+                links_100 = {(r["related_mal_id"], r["relation_type"]) for r in conn.execute("SELECT * FROM franchise_links WHERE mal_id=100")}
+                self.assertIn((200, "SEQUEL"), links_100)
 
                 # 4. Split-cour episode offset applied & UNIQUE anilist_id collision safely resolved
                 r300 = conn.execute("SELECT * FROM anime WHERE mal_id=300").fetchone()
@@ -296,7 +307,7 @@ class TestMappingsPipeline(unittest.TestCase):
                 self.assertIsNone(r300["anilist_id"])  # 201 already owned by 200
                 self.assertIsNone(r300["simkl_id"])  # mismatched Simkl mal=99999 rejected
 
-                # 5. ARM + Wikidata + AniDB titles backfill for mal_id=400
+                # 5. ARM + Wikidata + AniDB titles + schedule_ids + anime_aliases backfill for mal_id=400
                 r400 = conn.execute("SELECT * FROM anime WHERE mal_id=400").fetchone()
                 self.assertEqual(r400["anilist_id"], 401)
                 self.assertEqual(r400["thetvdb_id"], 444001)
@@ -304,13 +315,20 @@ class TestMappingsPipeline(unittest.TestCase):
                 self.assertEqual(r400["imdb_id"], "tt9998887")
                 self.assertEqual(r400["global_media_type"], "show")
                 self.assertEqual(r400["mal_title"], "AniDB Restored Main")
+                aliases_400 = {r["title"] for r in conn.execute("SELECT title FROM anime_aliases WHERE mal_id=400")}
+                self.assertNotIn("AniDB Restored Main", aliases_400)  # primary title kept on anime table only
+                self.assertIn("AniDB Restored Official EN", aliases_400)
+                s400 = conn.execute("SELECT * FROM schedule_ids WHERE mal_id=400").fetchone()
+                self.assertEqual(s400["annict_id"], 1)
+                self.assertEqual(s400["syobocal_tid"], 2)
 
-                # 6. Simkl extended hydration for mal_id=500
+                # 6. Simkl + Trakt hydration for mal_id=500
                 r500 = conn.execute("SELECT * FROM anime WHERE mal_id=500").fetchone()
                 self.assertEqual(r500["simkl_id"], 504)
                 self.assertEqual(r500["thetvdb_id"], 666001)
                 self.assertEqual(r500["themoviedb_id"], 777002)
                 self.assertEqual(r500["imdb_id"], "tt5000500")
+                self.assertEqual(r500["trakt_id"], 99500)
 
                 # 7. tvdb_rules table populated from both XML mapping-list & MALSync rules
                 rules = conn.execute("SELECT * FROM tvdb_rules ORDER BY mal_id, rule_type").fetchall()
@@ -334,9 +352,13 @@ class TestMappingsPipeline(unittest.TestCase):
             )
             conn.execute("CREATE TABLE activities (sync_id INTEGER PRIMARY KEY, last_updated TEXT NOT NULL)")
             conn.execute("CREATE TABLE tvdb_rules (mal_id INTEGER, tvdb_id INTEGER, season INTEGER, rule_type TEXT, range_start INTEGER, range_end INTEGER, ep_start INTEGER, absolute_start INTEGER, source TEXT)")
+            conn.execute("CREATE TABLE anime_aliases (mal_id INTEGER, title TEXT)")
+            conn.execute("CREATE TABLE franchise_links (mal_id INTEGER, related_mal_id INTEGER, relation_type TEXT, source TEXT)")
+            conn.execute("CREATE TABLE schedule_ids (mal_id INTEGER PRIMARY KEY, syobocal_tid INTEGER, annict_id INTEGER)")
             conn.execute("CREATE TABLE build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.execute("INSERT INTO anime (mal_id, thetvdb_id, imdb_id) VALUES (1, 'movie', 'bad_imdb')")
             conn.execute("INSERT INTO anime (mal_id) VALUES (66863)")
+            conn.execute("INSERT INTO franchise_links VALUES (1, 999999, 'SEQUEL', 'anilist')")
             conn.commit()
             conn.close()
 
@@ -345,6 +367,7 @@ class TestMappingsPipeline(unittest.TestCase):
             self.assertIn("thetvdb_id contains 1 non-integer", joined)
             self.assertIn("malformed non-ttNNNNN", joined)
             self.assertIn("empty orphan rows", joined)
+            self.assertIn("dangling mal_id references", joined)
             self.assertIn("Missing/unused index for themoviedb_id", joined)
 
 
