@@ -1038,8 +1038,60 @@ def _apply_anilist_media(records, media_list, ep_counts, prequel_edges, franchis
                 franchise_links[(mid, rel_mal, rel_type)] = "anilist"
 
 
-def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100, deadline=0.0):
-    """Optionally backfill missing trakt_id via TRAKT_CLIENT_ID IMDb/TMDb public search."""
+def _trakt_lookup_key(rec):
+    imdb = rec.get("imdb_id")
+    if imdb:
+        return ("imdb", imdb)
+    tmdb = rec.get("themoviedb_id")
+    if tmdb:
+        return ("tmdb", tmdb, "movie" if rec.get("global_media_type") == "movie" else "show")
+    return None
+
+
+def propagate_trakt_sibling_ids(records):
+    """Fill missing trakt_id from unambiguous sibling records sharing identical imdb_id or (tmdb_id, media_type)."""
+    imdb_tids = collections.defaultdict(set)
+    tmdb_tids = collections.defaultdict(set)
+    for r in records.values():
+        tid = parse_pos_int(r.get("trakt_id"))
+        if not tid:
+            continue
+        if r.get("imdb_id"):
+            imdb_tids[r["imdb_id"]].add(tid)
+        if r.get("themoviedb_id"):
+            mt = "movie" if r.get("global_media_type") == "movie" else "show"
+            tmdb_tids[(r["themoviedb_id"], mt)].add(tid)
+
+    imdb_exact = {k: next(iter(v)) for k, v in imdb_tids.items() if len(v) == 1}
+    tmdb_exact = {k: next(iter(v)) for k, v in tmdb_tids.items() if len(v) == 1}
+    filled = 0
+    for r in records.values():
+        if parse_pos_int(r.get("trakt_id")):
+            continue
+        imdb = r.get("imdb_id")
+        tmdb = r.get("themoviedb_id")
+        mt = "movie" if r.get("global_media_type") == "movie" else "show"
+        tid = imdb_exact.get(imdb) if imdb else None
+        if not tid and tmdb:
+            tid = tmdb_exact.get((tmdb, mt))
+        if tid:
+            r["trakt_id"] = tid
+            filled += 1
+    return filled
+
+
+def hydrate_trakt_ids(
+    records,
+    cache: ApiCache,
+    offline_dir=None,
+    max_items=100,
+    deadline=0.0,
+    client_id=None,
+    delay_seconds=0.28,
+    progress_every=0,
+    on_batch=None,
+):
+    """Backfill missing trakt_id via sibling consensus, ApiCache, and Trakt IMDb/TMDb public search."""
     if offline_dir:
         tk_fix = os.path.join(offline_dir, "trakt_items.json")
         if os.path.isfile(tk_fix):
@@ -1051,7 +1103,9 @@ def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100,
                     tid = parse_pos_int(val.get("trakt_id") if isinstance(val, dict) else val)
                     if mid and tid and mid in records and not records[mid]["trakt_id"]:
                         records[mid]["trakt_id"] = tid
-        return
+        return {"sibling_filled": 0, "http_requests": 0, "resolved_http": 0}
+
+    sibling_filled = propagate_trakt_sibling_ids(records)
 
     candidates = [
         mid for mid, r in records.items()
@@ -1059,28 +1113,53 @@ def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100,
     ]
     candidates.sort(reverse=True)
 
-    # Pass 1: apply cached Trakt IDs without spending HTTP quota
+    # Pass 1: apply cached Trakt IDs & build in-run dedup memo (0 HTTP calls)
     to_fetch = []
+    lookup_memo = {}
     for mid in candidates:
         tid = cache.get("trakt", mid, max_age_seconds=30 * 86400)
+        key = _trakt_lookup_key(records[mid])
         if tid is None:
             to_fetch.append(mid)
-        elif parse_pos_int(tid) and not records[mid]["trakt_id"]:
-            records[mid]["trakt_id"] = int(tid)
+        else:
+            pos_tid = parse_pos_int(tid) or 0
+            if key and key not in lookup_memo:
+                lookup_memo[key] = pos_tid
+            if pos_tid and not records[mid]["trakt_id"]:
+                records[mid]["trakt_id"] = pos_tid
 
-    if not TRAKT_CLIENT_ID:
-        return
+    api_key = (client_id or TRAKT_CLIENT_ID or "").strip()
+    if not api_key:
+        return {"sibling_filled": sibling_filled, "http_requests": 0, "resolved_http": 0}
 
     headers = {
         "Content-Type": "application/json",
         "trakt-api-version": "2",
-        "trakt-api-key": TRAKT_CLIENT_ID,
+        "trakt-api-key": api_key,
     }
     rate_limit_hits = 0
-    for mid in to_fetch[:max_items]:
-        if deadline and time.time() >= deadline:
-            break
+    http_requests = 0
+    resolved_http = 0
+    processed_unique = 0
+    t_start = time.time()
+
+    for mid in to_fetch:
         rec = records[mid]
+        key = _trakt_lookup_key(rec)
+        if key and key in lookup_memo:
+            tid = lookup_memo[key]
+            cache.set("trakt", mid, tid)
+            if tid and not rec["trakt_id"]:
+                rec["trakt_id"] = int(tid)
+                resolved_http += 1
+            continue
+
+        if max_items and processed_unique >= max_items:
+            continue
+        if deadline and time.time() >= deadline:
+            continue
+
+        processed_unique += 1
         tid = 0
         try:
             imdb = rec.get("imdb_id")
@@ -1089,13 +1168,20 @@ def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100,
                 if imdb
                 else f"https://api.trakt.tv/search/tmdb/{rec['themoviedb_id']}?type={'movie' if rec.get('global_media_type') == 'movie' else 'show'}"
             )
-            raw, status, _ = _http_get_bytes(url, headers=headers, timeout=10, retries=1)
+            http_requests += 1
+            raw, status, resp_headers = _http_get_bytes(url, headers=headers, timeout=12, retries=1)
             if status == 429:
                 rate_limit_hits += 1
-                if rate_limit_hits >= 3:
+                if rate_limit_hits >= 5:
                     break
-                time.sleep(1.5)
-                continue
+                try:
+                    retry_after = min(65.0, max(2.0, float((resp_headers or {}).get("Retry-After") or 10.0)))
+                except (TypeError, ValueError):
+                    retry_after = 10.0
+                time.sleep(retry_after)
+                raw, status, _ = _http_get_bytes(url, headers=headers, timeout=12, retries=0)
+                if status == 429:
+                    break
             if status == 200 and raw:
                 arr = json.loads(raw.decode("utf-8"))
                 if isinstance(arr, list) and arr:
@@ -1104,13 +1190,36 @@ def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100,
                     tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
             if status in (200, 404, 400):
                 cache.set("trakt", mid, tid)
-            time.sleep(0.28)
+                if key:
+                    lookup_memo[key] = tid
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
         except Exception:
             cache.set("trakt", mid, 0)
+            if key:
+                lookup_memo[key] = 0
         if parse_pos_int(tid) and not rec["trakt_id"]:
             rec["trakt_id"] = int(tid)
+            resolved_http += 1
+        if on_batch and (processed_unique % 50 == 0):
+            on_batch(records)
+        if progress_every and (processed_unique % progress_every == 0):
+            total_now = sum(1 for r in records.values() if r.get("trakt_id"))
+            elapsed_s = int(time.time() - t_start)
+            print(
+                f"  [Trakt unique={processed_unique:,}] http={http_requests:,} +{resolved_http:,} "
+                f"total_trakt={total_now:,} elapsed={elapsed_s}s",
+                flush=True,
+            )
+
+    if on_batch:
+        on_batch(records)
     resolved_total = sum(1 for r in records.values() if r.get("trakt_id"))
-    print(f"Trakt hydration: total={resolved_total:,} (queue={len(to_fetch):,}, cap={max_items})")
+    print(
+        f"Trakt hydration: total={resolved_total:,} (siblings=+{sibling_filled:,}, "
+        f"queue={len(to_fetch):,}, http={http_requests:,}, resolved=+{resolved_http:,})"
+    )
+    return {"sibling_filled": sibling_filled, "http_requests": http_requests, "resolved_http": resolved_http}
 
 
 def _fetch_simkl_record(mal_id, existing_simkl_id=None):

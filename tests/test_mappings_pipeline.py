@@ -422,14 +422,17 @@ class TestMappingsPipeline(unittest.TestCase):
             records = {
                 900: build_mappings.empty_record(900) | {"imdb_id": "tt0000900"},
                 800: build_mappings.empty_record(800) | {"imdb_id": "tt0000800"},
+                801: build_mappings.empty_record(801) | {"imdb_id": "tt0000800", "trakt_id": 4444},
                 700: build_mappings.empty_record(700) | {"imdb_id": "tt0000700"},
+                701: build_mappings.empty_record(701) | {"imdb_id": "tt0000700"},
             }
             payload = json.dumps([{"show": {"ids": {"trakt": 7777}}}]).encode("utf-8")
             with mock.patch.dict(os.environ, {}, clear=False), \
                  mock.patch.object(build_mappings, "TRAKT_CLIENT_ID", "test_cid"), \
                  mock.patch.object(build_mappings, "_http_get_bytes", return_value=(payload, 200, {})) as mock_get:
-                build_mappings.hydrate_trakt_ids(records, cache, max_items=1)
+                build_mappings.hydrate_trakt_ids(records, cache, max_items=1, delay_seconds=0.0)
             self.assertEqual(records[800]["trakt_id"], 4444)
+            self.assertEqual(records[701]["trakt_id"], 7777)
             self.assertEqual(records[700]["trakt_id"], 7777)
             self.assertEqual(mock_get.call_count, 1)
 
