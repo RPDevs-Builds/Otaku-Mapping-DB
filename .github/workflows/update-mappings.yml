@@ -8,11 +8,11 @@ on:
       api_budget_seconds:
         description: 'Max live API hydration seconds (0 skips live APIs)'
         required: false
-        default: '180'
+        default: '240'
       max_api_items:
         description: 'Max delta shows to hydrate per run'
         required: false
-        default: '350'
+        default: '600'
   push:
     branches:
       - main
@@ -87,8 +87,8 @@ jobs:
           if [ -f .seed/anime_mappings.db ]; then
             SEED_FLAG="--seed .seed/anime_mappings.db"
           fi
-          BUDGET="${{ github.event.inputs.api_budget_seconds || '180' }}"
-          ITEMS="${{ github.event.inputs.max_api_items || '350' }}"
+          BUDGET="${{ github.event.inputs.api_budget_seconds || '240' }}"
+          ITEMS="${{ github.event.inputs.max_api_items || '600' }}"
           python3 scripts/build_mappings.py \
             $SEED_FLAG \
             --output dist/anime_mappings.db \

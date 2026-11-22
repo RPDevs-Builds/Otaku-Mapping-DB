@@ -11,6 +11,7 @@ anime_mappings.db plus .xz archive and SHA-256 manifest.
 
 import argparse
 import collections
+import concurrent.futures
 import datetime
 import gzip
 import hashlib
@@ -21,13 +22,15 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-SCHEMA_VERSION = "2.4"
+SCHEMA_VERSION = "2.5"
 
 SOURCE_URLS = {
     "fribb": "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json",
@@ -343,10 +346,11 @@ def _http_post_json(url, payload, timeout=20, retries=2):
 
 
 class ApiCache:
-    """Persistent JSON response cache under --cache-dir for incremental API hydration."""
+    """Persistent thread-safe JSON response cache under --cache-dir for incremental API hydration."""
 
     def __init__(self, cache_dir):
         self.cache_dir = cache_dir
+        self._lock = threading.Lock()
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
 
@@ -373,10 +377,11 @@ class ApiCache:
         if not self.cache_dir:
             return
         path = self._path(namespace, key)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"fetched_at": time.time(), "data": data}, f)
-        os.replace(tmp, path)
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        with self._lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"fetched_at": time.time(), "data": data}, f)
+            os.replace(tmp, path)
 
 
 def load_source_blob(
@@ -1288,6 +1293,17 @@ def _media_kind(rec):
     return "show"
 
 
+_RE_TRAILING_YEAR = re.compile(r"\s*\(\d{4}\)\s*$")
+
+
+def _norm_trakt_title(title):
+    if not title:
+        return ""
+    s = unicodedata.normalize("NFKC", str(title)).lower()
+    s = _RE_TRAILING_YEAR.sub(" ", s)
+    return _RE_NON_ALNUM.sub(" ", s).strip()
+
+
 def _trakt_lookup_key(rec):
     kind = _media_kind(rec)
     imdb = rec.get("imdb_id")
@@ -1297,6 +1313,64 @@ def _trakt_lookup_key(rec):
     if tmdb:
         return ("tmdb", tmdb, kind)
     return None
+
+
+def _match_trakt_title_year_candidate(arr, rec, kind, title_norms):
+    """Select an unambiguous Trakt entry matching *title_norms*, +/-1 year, and non-conflicting IDs."""
+    rec_year = parse_pos_int(rec.get("year"))
+    if not rec_year or not title_norms or not isinstance(arr, list):
+        return None
+    exact_matches = []
+    near_matches = []
+    for entry in arr:
+        if not isinstance(entry, dict) or kind not in entry:
+            continue
+        obj = entry.get(kind) or {}
+        ids = obj.get("ids") or {}
+        tid = parse_pos_int(ids.get("trakt"))
+        if not tid:
+            continue
+        tyear = parse_pos_int(obj.get("year"))
+        if not tyear or abs(tyear - rec_year) > 1:
+            continue
+        t_norm = _norm_trakt_title(obj.get("title"))
+        if not t_norm or t_norm not in title_norms:
+            continue
+        c_tvdb = parse_pos_int(ids.get("tvdb"))
+        c_tmdb = parse_pos_int(ids.get("tmdb"))
+        c_imdb = clean_imdb_id(ids.get("imdb"))
+        if rec.get("thetvdb_id") and c_tvdb and rec["thetvdb_id"] != c_tvdb:
+            continue
+        if rec.get("themoviedb_id") and c_tmdb and rec["themoviedb_id"] != c_tmdb:
+            continue
+        if rec.get("imdb_id") and c_imdb and rec["imdb_id"] != c_imdb:
+            continue
+        hit = {"trakt_id": tid, "thetvdb_id": c_tvdb, "themoviedb_id": c_tmdb, "imdb_id": c_imdb}
+        if tyear == rec_year:
+            exact_matches.append(hit)
+        else:
+            near_matches.append(hit)
+    pool = exact_matches or near_matches
+    distinct_tids = {h["trakt_id"] for h in pool}
+    return pool[0] if len(distinct_tids) == 1 else None
+
+
+def _apply_trakt_payload(rec, payload):
+    """Apply resolved Trakt ID and backfill missing IMDb/TMDb/TVDB IDs safely."""
+    if not rec or not isinstance(payload, dict):
+        return False
+    tid = parse_pos_int(payload.get("trakt_id"))
+    if not tid or rec.get("trakt_id"):
+        return False
+    rec["trakt_id"] = tid
+    if not rec.get("thetvdb_id") and parse_pos_int(payload.get("thetvdb_id")):
+        rec["thetvdb_id"] = parse_pos_int(payload["thetvdb_id"])
+    if not rec.get("themoviedb_id") and parse_pos_int(payload.get("themoviedb_id")):
+        rec["themoviedb_id"] = parse_pos_int(payload["themoviedb_id"])
+    c_imdb = clean_imdb_id(payload.get("imdb_id"))
+    if not rec.get("imdb_id") and c_imdb:
+        rec["imdb_id"] = c_imdb
+    return True
 
 
 def sanitize_trakt_collisions(records):
@@ -1422,8 +1496,9 @@ def hydrate_trakt_ids(
     delay_seconds=0.28,
     progress_every=0,
     on_batch=None,
+    aliases_map=None,
 ):
-    """Backfill missing trakt_id via sibling consensus, ApiCache, and Trakt IMDb/TMDb public search."""
+    """Backfill missing trakt_id via sibling consensus, ApiCache, ID search, and title+year fallback."""
     if offline_dir:
         tk_fix = os.path.join(offline_dir, "trakt_items.json")
         if os.path.isfile(tk_fix):
@@ -1439,26 +1514,56 @@ def hydrate_trakt_ids(
 
     sibling_filled = propagate_trakt_sibling_ids(records)
 
-    candidates = [
-        mid for mid, r in records.items()
-        if not r.get("trakt_id") and (r.get("imdb_id") or r.get("themoviedb_id"))
-    ]
-    candidates.sort(key=lambda mid: _hydration_priority_key(mid, records.get(mid)))
+    # Index normalized candidate titles for title+year fallback when IMDb/TMDb are absent
+    titles_by_mid = collections.defaultdict(set)
+    for mid, r in records.items():
+        mt = _norm_trakt_title(r.get("mal_title"))
+        if len(mt) >= 3:
+            titles_by_mid[mid].add(mt)
+    for (amid, _anorm), aval in (aliases_map or {}).items():
+        if aval and len(aval) >= 2 and aval[1] != "short":
+            at = _norm_trakt_title(aval[0])
+            if len(at) >= 4:
+                titles_by_mid[amid].add(at)
+
+    id_candidates = []
+    title_candidates = []
+    for mid, r in records.items():
+        if r.get("trakt_id"):
+            continue
+        if r.get("imdb_id") or r.get("themoviedb_id"):
+            id_candidates.append(mid)
+        elif (
+            str(r.get("anime_media_type") or "").upper() in ("TV", "ONA", "MOVIE")
+            and parse_pos_int(r.get("year"))
+            and (r.get("year") or 0) >= 1960
+            and len(_norm_trakt_title(r.get("mal_title"))) >= 3
+        ):
+            title_candidates.append(mid)
+    id_candidates.sort(key=lambda mid: _hydration_priority_key(mid, records.get(mid)))
+    title_candidates.sort(key=lambda mid: _hydration_priority_key(mid, records.get(mid)))
 
     # Pass 1: apply cached Trakt IDs & build in-run dedup memo (0 HTTP calls)
     to_fetch = []
     lookup_memo = {}
-    for mid in candidates:
+    for mid in id_candidates:
         tid = cache.get("trakt", mid, max_age_seconds=30 * 86400)
         key = _trakt_lookup_key(records[mid])
         if tid is None:
-            to_fetch.append(mid)
+            to_fetch.append((mid, "id"))
         else:
             pos_tid = parse_pos_int(tid) or 0
             if key and key not in lookup_memo:
                 lookup_memo[key] = pos_tid
             if pos_tid and not records[mid]["trakt_id"]:
                 records[mid]["trakt_id"] = pos_tid
+
+    for mid in title_candidates:
+        cached = cache.get("trakt", f"title_{mid}", max_age_seconds=30 * 86400)
+        if cached is None:
+            to_fetch.append((mid, "title"))
+        elif isinstance(cached, dict):
+            _apply_trakt_payload(records[mid], cached)
 
     api_key = (client_id or TRAKT_CLIENT_ID or "").strip()
     if not api_key:
@@ -1476,9 +1581,25 @@ def hydrate_trakt_ids(
     processed_unique = 0
     t_start = time.time()
 
-    for mid in to_fetch:
+    def _trakt_get_with_retry(req_url):
+        nonlocal http_requests, rate_limit_hits
+        http_requests += 1
+        raw, status, resp_headers = _http_get_bytes(req_url, headers=headers, timeout=12, retries=1)
+        if status == 429:
+            rate_limit_hits += 1
+            if rate_limit_hits >= 5:
+                return None, 429
+            try:
+                retry_after = min(65.0, max(2.0, float((resp_headers or {}).get("Retry-After") or 10.0)))
+            except (TypeError, ValueError):
+                retry_after = 10.0
+            time.sleep(retry_after)
+            raw, status, _ = _http_get_bytes(req_url, headers=headers, timeout=12, retries=0)
+        return raw, status
+
+    for mid, mode in to_fetch:
         rec = records[mid]
-        key = _trakt_lookup_key(rec)
+        key = _trakt_lookup_key(rec) if mode == "id" else None
         if key and key in lookup_memo:
             tid = lookup_memo[key]
             cache.set("trakt", mid, tid)
@@ -1495,51 +1616,61 @@ def hydrate_trakt_ids(
         processed_unique += 1
         tid = 0
         try:
-            imdb = rec.get("imdb_id")
             kind = _media_kind(rec)
-            mtype_known = rec.get("anime_media_type") in ("TV", "ONA", "MOVIE") or rec.get("global_media_type") in ("show", "movie")
-            q_type = kind if mtype_known else "show,movie"
-            url = (
-                f"https://api.trakt.tv/search/imdb/{urllib.parse.quote(imdb)}?type={q_type}"
-                if imdb
-                else f"https://api.trakt.tv/search/tmdb/{rec['themoviedb_id']}?type={kind}"
-            )
-            http_requests += 1
-            raw, status, resp_headers = _http_get_bytes(url, headers=headers, timeout=12, retries=1)
-            if status == 429:
-                rate_limit_hits += 1
-                if rate_limit_hits >= 5:
-                    break
-                try:
-                    retry_after = min(65.0, max(2.0, float((resp_headers or {}).get("Retry-After") or 10.0)))
-                except (TypeError, ValueError):
-                    retry_after = 10.0
-                time.sleep(retry_after)
-                raw, status, _ = _http_get_bytes(url, headers=headers, timeout=12, retries=0)
+            if mode == "id":
+                imdb = rec.get("imdb_id")
+                mtype_known = rec.get("anime_media_type") in ("TV", "ONA", "MOVIE") or rec.get("global_media_type") in ("show", "movie")
+                q_type = kind if mtype_known else "show,movie"
+                url = (
+                    f"https://api.trakt.tv/search/imdb/{urllib.parse.quote(imdb)}?type={q_type}"
+                    if imdb
+                    else f"https://api.trakt.tv/search/tmdb/{rec['themoviedb_id']}?type={kind}"
+                )
+                raw, status = _trakt_get_with_retry(url)
                 if status == 429:
                     break
-            if status == 200 and raw:
-                arr = json.loads(raw.decode("utf-8"))
-                if isinstance(arr, list) and arr:
-                    entry = next(
-                        (e for e in arr if (kind in e)),
-                        arr[0],
-                    )
-                    obj = entry.get(kind) or entry.get("show") or entry.get("movie") or {}
-                    tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
-            if status in (200, 404, 400):
-                cache.set("trakt", mid, tid)
-                if key:
-                    lookup_memo[key] = tid
+                if status == 200 and raw:
+                    arr = json.loads(raw.decode("utf-8"))
+                    if isinstance(arr, list) and arr:
+                        entry = next((e for e in arr if (kind in e)), arr[0])
+                        obj = entry.get(kind) or entry.get("show") or entry.get("movie") or {}
+                        tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
+                if status in (200, 404, 400):
+                    cache.set("trakt", mid, tid)
+                    if key:
+                        lookup_memo[key] = tid
+                if parse_pos_int(tid) and not rec["trakt_id"]:
+                    rec["trakt_id"] = int(tid)
+                    resolved_http += 1
+            else:
+                q_title = str(rec.get("mal_title") or "").strip()
+                yr = parse_pos_int(rec.get("year"))
+                url = (
+                    f"https://api.trakt.tv/search/{kind}"
+                    f"?query={urllib.parse.quote(q_title)}&years={max(1950, yr - 1)}-{yr + 1}"
+                )
+                raw, status = _trakt_get_with_retry(url)
+                if status == 429:
+                    break
+                hit = None
+                if status == 200 and raw:
+                    arr = json.loads(raw.decode("utf-8"))
+                    hit = _match_trakt_title_year_candidate(arr, rec, kind, titles_by_mid.get(mid))
+                if status in (200, 404, 400):
+                    cache.set("trakt", f"title_{mid}", hit if hit else 0)
+                if hit and _apply_trakt_payload(rec, hit):
+                    resolved_http += 1
+
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
         except Exception:
-            cache.set("trakt", mid, 0)
-            if key:
-                lookup_memo[key] = 0
-        if parse_pos_int(tid) and not rec["trakt_id"]:
-            rec["trakt_id"] = int(tid)
-            resolved_http += 1
+            if mode == "id":
+                cache.set("trakt", mid, 0)
+                if key:
+                    lookup_memo[key] = 0
+            else:
+                cache.set("trakt", f"title_{mid}", 0)
+
         if on_batch and (processed_unique % 50 == 0):
             on_batch(records)
         if progress_every and (processed_unique % progress_every == 0):
@@ -1747,56 +1878,70 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
         if want_az or want_sk:
             uncached_queue.append((mid, want_az, want_sk, ttl))
 
-    for mid in malsync_queue[:min(80, max_items)]:
-        if deadline and time.time() >= deadline:
-            break
-        ms = {}
-        try:
-            raw, status, _ = _http_get_bytes(f"https://api.malsync.moe/tvdb/rules/cache-key/{mid}", timeout=12, retries=1)
-            ms = json.loads(raw.decode("utf-8")) if (status == 200 and raw) else {}
-            cache.set("malsync_rules", mid, ms)
-            time.sleep(0.2)
-        except Exception:
+    ms_items = malsync_queue[:min(80, max_items)]
+    if ms_items and not (deadline and time.time() >= deadline):
+        def _fetch_malsync_worker(mid):
+            if deadline and time.time() >= deadline:
+                return mid, None
             ms = {}
-        if isinstance(ms, dict) and ms:
-            extra_rules.extend(_apply_malsync_rules(records, mid, ms, by_anilist=by_anilist))
-
-    for mid, fetch_az, fetch_sk, _ttl in uncached_queue[:max_items]:
-        if deadline and time.time() >= deadline:
-            break
-        rec = records[mid]
-
-        # 1. AniZip mappings
-        if fetch_az:
-            az = {}
             try:
-                raw, status, _ = _http_get_bytes(f"https://api.ani.zip/mappings?mal_id={mid}", timeout=12, retries=1)
-                az = json.loads(raw.decode("utf-8")) if (status == 200 and raw) else {}
-                cache.set("anizip", mid, az)
-                time.sleep(0.25)
+                raw, status, _ = _http_get_bytes(f"https://api.malsync.moe/tvdb/rules/cache-key/{mid}", timeout=12, retries=1)
+                ms = json.loads(raw.decode("utf-8")) if (status == 200 and raw) else {}
+                cache.set("malsync_rules", mid, ms)
+                time.sleep(0.05)
             except Exception:
-                az = {}
-            if isinstance(az, dict) and az:
-                _apply_anizip(records, mid, az, ep_counts)
+                ms = {}
+            return mid, ms
 
-        # 2. Simkl fallback when TVDB/TMDB/IMDb/Simkl ID still missing
-        if deadline and time.time() >= deadline:
-            break
-        if fetch_sk and SIMKL_CLIENT_ID and (
-            not rec.get("thetvdb_id")
-            or not rec.get("themoviedb_id")
-            or not rec.get("imdb_id")
-            or not rec.get("simkl_id")
-        ):
-            sk = {}
-            try:
-                sk = _fetch_simkl_record(mid, rec.get("simkl_id"))
-                cache.set("simkl", mid, sk)
-                time.sleep(0.2)
-            except Exception:
-                sk = {}
-            if isinstance(sk, dict) and sk:
-                _apply_simkl(records, mid, sk, ep_counts)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for mid, ms in pool.map(_fetch_malsync_worker, ms_items):
+                if isinstance(ms, dict) and ms:
+                    extra_rules.extend(_apply_malsync_rules(records, mid, ms, by_anilist=by_anilist))
+
+    az_sk_items = uncached_queue[:max_items]
+    if az_sk_items and not (deadline and time.time() >= deadline):
+        def _fetch_az_sk_worker(item):
+            mid, fetch_az, fetch_sk, _ttl = item
+            if deadline and time.time() >= deadline:
+                return mid, None, None
+            rec_snapshot = records.get(mid) or {}
+            az = None
+            sk = None
+            has_tvdb = bool(rec_snapshot.get("thetvdb_id"))
+            has_tmdb = bool(rec_snapshot.get("themoviedb_id"))
+            has_imdb = bool(rec_snapshot.get("imdb_id"))
+            has_simkl = bool(rec_snapshot.get("simkl_id"))
+
+            if fetch_az:
+                try:
+                    raw, status, _ = _http_get_bytes(f"https://api.ani.zip/mappings?mal_id={mid}", timeout=12, retries=1)
+                    az = json.loads(raw.decode("utf-8")) if (status == 200 and raw) else {}
+                    cache.set("anizip", mid, az)
+                    m = az.get("mappings") or {}
+                    has_tvdb = has_tvdb or bool(parse_pos_int(m.get("thetvdb_id")))
+                    has_tmdb = has_tmdb or bool(parse_pos_int(m.get("themoviedb_id")))
+                    has_imdb = has_imdb or bool(clean_imdb_id(m.get("imdb_id")))
+                    time.sleep(0.08)
+                except Exception:
+                    az = {}
+
+            if fetch_sk and SIMKL_CLIENT_ID and not (deadline and time.time() >= deadline) and (
+                not has_tvdb or not has_tmdb or not has_imdb or not has_simkl
+            ):
+                try:
+                    sk = _fetch_simkl_record(mid, rec_snapshot.get("simkl_id"))
+                    cache.set("simkl", mid, sk)
+                    time.sleep(0.08)
+                except Exception:
+                    sk = {}
+            return mid, az, sk
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for mid, az, sk in pool.map(_fetch_az_sk_worker, az_sk_items):
+                if isinstance(az, dict) and az:
+                    _apply_anizip(records, mid, az, ep_counts)
+                if isinstance(sk, dict) and sk:
+                    _apply_simkl(records, mid, sk, ep_counts)
 
     return extra_rules
 
@@ -1980,8 +2125,10 @@ def _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_co
         if rtype == "PREQUEL"
     }
 
+    _RE_SEASON_TAIL = re.compile(r"\s*(?::|-)?\s*(?:season\s+1|1st\s+season|part\s+1)\s*$", re.I)
+
     def _register_title(mid, raw_t, prio):
-        if mid not in records:
+        if mid not in records or not raw_t:
             return
         rec = records[mid]
         mtype = rec.get("anime_media_type") or ""
@@ -2001,6 +2148,10 @@ def _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_co
         if stripped and stripped != norm:
             s_rank = (rank[0], prio + 2, rank[2], rank[3], mid)
             title_index[stripped].append((s_rank, mid))
+        base_season = _norm_afl_title(_RE_SEASON_TAIL.sub("", str(raw_t)), strip_parens=True)
+        if base_season and len(base_season) >= 4 and base_season not in (norm, stripped):
+            b_rank = (rank[0], prio + 4, rank[2], rank[3], mid)
+            title_index[base_season].append((b_rank, mid))
 
     for mid, rec in records.items():
         _register_title(mid, rec.get("mal_title"), 0)
@@ -2166,20 +2317,27 @@ def hydrate_and_map_filler_ranges(records, aliases_map, franchise_links, cache: 
         else:
             to_fetch.append(slug)
 
-    for slug in to_fetch:
-        if deadline and time.time() >= deadline:
-            break
-        try:
-            raw, status, _ = _http_get_bytes(f"{SOURCE_URLS['animefillerlist']}/{slug}", timeout=12, retries=1)
-            if status == 200 and raw:
-                parsed = _parse_afl_show_html(raw.decode("utf-8", "ignore"), slug=slug)
-                cache.set("afl", f"show_{slug}", parsed)
-                shows.append(parsed)
-            elif status == 404:
-                cache.set("afl", f"show_{slug}", {"slug": slug, "title": "", "max_ep": 0, "episodes": {}})
-            time.sleep(0.1)
-        except Exception:
-            continue
+    if to_fetch and not (deadline and time.time() >= deadline):
+        def _fetch_afl_worker(slug):
+            if deadline and time.time() >= deadline:
+                return None
+            try:
+                raw, status, _ = _http_get_bytes(f"{SOURCE_URLS['animefillerlist']}/{slug}", timeout=12, retries=1)
+                if status == 200 and raw:
+                    parsed = _parse_afl_show_html(raw.decode("utf-8", "ignore"), slug=slug)
+                    cache.set("afl", f"show_{slug}", parsed)
+                    time.sleep(0.05)
+                    return parsed
+                elif status == 404:
+                    cache.set("afl", f"show_{slug}", {"slug": slug, "title": "", "max_ep": 0, "episodes": {}})
+            except Exception:
+                pass
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for parsed in pool.map(_fetch_afl_worker, to_fetch):
+                if isinstance(parsed, dict):
+                    shows.append(parsed)
 
     return _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_counts)
 
@@ -2559,7 +2717,7 @@ def build_pipeline(args):
         )
         hydrate_trakt_ids(
             records, cache, args.offline_fixtures,
-            max_items=min(1000, args.max_api_items), deadline=trakt_deadline,
+            max_items=min(1000, args.max_api_items), deadline=trakt_deadline, aliases_map=aliases_map,
         )
 
     apply_prequel_inheritance(records, prequel_edges, manami_related)

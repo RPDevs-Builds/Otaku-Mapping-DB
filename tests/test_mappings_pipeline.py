@@ -494,7 +494,7 @@ class TestMappingsPipeline(unittest.TestCase):
                 aliases_700 = {r["title"] for r in conn.execute("SELECT title FROM anime_aliases WHERE mal_id=700")}
                 self.assertNotIn("000", aliases_700)
                 self.assertIn("Legacy Saga Full English Title & Extra", aliases_700)
-                self.assertEqual(manifest["schema_version"], "2.4")
+                self.assertEqual(manifest["schema_version"], "2.5")
                 self.assertEqual(manifest["filler_show_count"], 3)
                 self.assertEqual(manifest["filler_range_count"], 6)
                 like_plan = " | ".join(
@@ -614,6 +614,67 @@ class TestMappingsPipeline(unittest.TestCase):
             self.assertIsNone(records[99001]["trakt_id"])
             self.assertIsNone(records[99002]["trakt_id"])
             self.assertIsNone(records[99003]["trakt_id"])
+
+    def test_v25_trakt_title_year_fallback_and_concurrent_hydration(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = build_mappings.ApiCache(tmp)
+            records = {
+                61001: build_mappings.empty_record(61001) | {
+                    "mal_title": "Brand New Fantasy", "anime_media_type": "TV",
+                    "status": "ONGOING", "year": 2025,
+                },
+                61002: build_mappings.empty_record(61002) | {
+                    "mal_title": "Wrong Year Show", "anime_media_type": "TV",
+                    "status": "FINISHED", "year": 2025, "thetvdb_id": 444444,
+                },
+                61003: build_mappings.empty_record(61003) | {
+                    "mal_title": "Hero Tales: Season 1", "anime_media_type": "TV",
+                    "status": "FINISHED", "year": 2024,
+                },
+            }
+
+            def _fake_http(url, headers=None, timeout=12, retries=1):
+                if "search/show" in url and "Brand%20New%20Fantasy" in url:
+                    return json.dumps([
+                        {"show": {"title": "Brand New Fantasy", "year": 2025, "ids": {"trakt": 91001, "tvdb": 51001, "tmdb": 61001, "imdb": "tt51001"}}}
+                    ]).encode("utf-8"), 200, {}
+                if "search/show" in url and "Wrong%20Year%20Show" in url:
+                    # Year disagrees (2020) and TVDB disagrees (999999) -> must reject
+                    return json.dumps([
+                        {"show": {"title": "Wrong Year Show", "year": 2020, "ids": {"trakt": 99999, "tvdb": 999999}}}
+                    ]).encode("utf-8"), 200, {}
+                if "api.ani.zip" in url and "61003" in url:
+                    return json.dumps({"mappings": {"thetvdb_id": 77703, "themoviedb_id": 88803}, "episodeCount": 12}).encode("utf-8"), 200, {}
+                if url.endswith("/shows"):
+                    return b'<a href="/shows/hero-tales">Hero Tales</a>', 200, {}
+                if url.endswith("/shows/hero-tales"):
+                    return (
+                        b'<h1>Hero Tales Filler List</h1>'
+                        b'<table class="EpisodeList"><tr><td class="Number">4</td>'
+                        b'<td class="Type"><span>Filler</span></td></tr></table>'
+                    ), 200, {}
+                return b"{}", 200, {}
+
+            with mock.patch.object(build_mappings, "TRAKT_CLIENT_ID", "test_cid"), \
+                 mock.patch.object(build_mappings, "SIMKL_CLIENT_ID", ""), \
+                 mock.patch.object(build_mappings, "_http_get_bytes", side_effect=_fake_http):
+                ep_counts = {61003: 12}
+                build_mappings.hydrate_anizip_and_malsync(records, cache, ep_counts, max_items=10)
+                self.assertEqual(records[61003]["thetvdb_id"], 77703)
+                self.assertEqual(records[61003]["themoviedb_id"], 88803)
+
+                build_mappings.hydrate_trakt_ids(records, cache, max_items=10, delay_seconds=0.0)
+                self.assertEqual(records[61001]["trakt_id"], 91001)
+                self.assertEqual(records[61001]["thetvdb_id"], 51001)
+                self.assertEqual(records[61001]["imdb_id"], "tt51001")
+                self.assertIsNone(records[61002]["trakt_id"])
+
+                fr, matched = build_mappings.hydrate_and_map_filler_ranges(
+                    records, {}, {}, cache, ep_counts,
+                )
+                self.assertEqual(matched, 1)
+                self.assertEqual(fr, [(61003, 4, 4, "Filler")])
 
 
 if __name__ == "__main__":

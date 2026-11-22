@@ -26,7 +26,7 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
 
 ## Schema & Performance Enhancements
 
-- **Backward-Compatible Extended `anime` Table (`v2.4`)**: Preserves all 21 core columns (`mal_id`, `mal_dub_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_title`, `mal_picture`, `thetvdb_season`, `thetvdb_part`, `duration`, `score`, `status`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`) and adds indexed `year` (`INTEGER`) and `anime_season` (`WINTER`/`SPRING`/`SUMMER`/`FALL`).
+- **Backward-Compatible Extended `anime` Table (`v2.4`–`v2.5`)**: Preserves all 21 core columns (`mal_id`, `mal_dub_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_title`, `mal_picture`, `thetvdb_season`, `thetvdb_part`, `duration`, `score`, `status`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`) and adds indexed `year` (`INTEGER`) and `anime_season` (`WINTER`/`SPRING`/`SUMMER`/`FALL`), plus concurrent `v2.5` AniZip/Simkl/AFL hydration and Trakt title+year fallback.
 - **Zero Full-Table Scans**: Adds B-tree indexes on `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, `mal_title`, and `year`, plus `ANALYZE` statistics and `VACUUM` optimization for `file:...db?mode=ro` readers.
 - **Additive Tables**:
   - `tvdb_rules`: Split-cour, special, and `absolute_start` episode mapping rules from `Anime-Lists` XML and `MALSync`.
