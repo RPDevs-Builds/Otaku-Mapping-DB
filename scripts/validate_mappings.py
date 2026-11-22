@@ -147,6 +147,14 @@ def validate_database(
             if "SCAN anime" in plan_txt:
                 errors.append(f"Missing/unused index for {col}: query plan = '{plan_txt}'")
 
+        # Ensure prefix LIKE searches on mal_title use NOCASE index SEARCH instead of full table SCAN
+        like_plan = " | ".join(
+            str(r[-1])
+            for r in conn.execute("EXPLAIN QUERY PLAN SELECT mal_id FROM anime WHERE mal_title LIKE 'Cowboy%'").fetchall()
+        )
+        if "SCAN anime" in like_plan or "SEARCH anime" not in like_plan:
+            errors.append(f"mal_title prefix LIKE does not use NOCASE index SEARCH: query plan = '{like_plan}'")
+
         idx_names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
 
         # Verify v2.2 relational index existence, query plan, & zero dangling foreign IDs

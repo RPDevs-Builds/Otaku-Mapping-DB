@@ -497,6 +497,11 @@ class TestMappingsPipeline(unittest.TestCase):
                 self.assertEqual(manifest["schema_version"], "2.4")
                 self.assertEqual(manifest["filler_show_count"], 3)
                 self.assertEqual(manifest["filler_range_count"], 6)
+                like_plan = " | ".join(
+                    str(r[-1])
+                    for r in conn.execute("EXPLAIN QUERY PLAN SELECT mal_id FROM anime WHERE mal_title LIKE 'Test%'").fetchall()
+                )
+                self.assertIn("SEARCH anime USING COVERING INDEX ix_mal_title", like_plan)
             finally:
                 conn.close()
 
@@ -580,6 +585,35 @@ class TestMappingsPipeline(unittest.TestCase):
         self.assertEqual(records[2264]["trakt_id"], 8630)
         self.assertEqual(records[1222]["trakt_id"], 22476)
         self.assertIsNone(records[8337]["trakt_id"])
+
+    def test_hydration_prioritizes_tv_ongoing_finished_over_special_upcoming(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = build_mappings.ApiCache(tmp)
+            records = {
+                99001: build_mappings.empty_record(99001) | {
+                    "anime_media_type": "SPECIAL", "status": "FINISHED", "imdb_id": "tt0099001"
+                },
+                99002: build_mappings.empty_record(99002) | {
+                    "anime_media_type": "TV", "status": "UPCOMING", "imdb_id": "tt0099002"
+                },
+                99003: build_mappings.empty_record(99003) | {
+                    "anime_media_type": "TV", "status": "FINISHED", "imdb_id": "tt0099003"
+                },
+                99004: build_mappings.empty_record(99004) | {
+                    "anime_media_type": "TV", "status": "ONGOING", "imdb_id": "tt0099004"
+                },
+            }
+            payload = json.dumps([{"show": {"ids": {"trakt": 8888}}}]).encode("utf-8")
+            with mock.patch.object(build_mappings, "TRAKT_CLIENT_ID", "test_cid"), \
+                 mock.patch.object(build_mappings, "_http_get_bytes", return_value=(payload, 200, {})) as mock_get:
+                build_mappings.hydrate_trakt_ids(records, cache, max_items=1, delay_seconds=0.0)
+            self.assertEqual(mock_get.call_count, 1)
+            self.assertIn("tt0099004", mock_get.call_args[0][0])
+            self.assertEqual(records[99004]["trakt_id"], 8888)
+            self.assertIsNone(records[99001]["trakt_id"])
+            self.assertIsNone(records[99002]["trakt_id"])
+            self.assertIsNone(records[99003]["trakt_id"])
 
 
 if __name__ == "__main__":

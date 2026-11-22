@@ -1397,6 +1397,21 @@ def propagate_trakt_sibling_ids(records):
     return filled
 
 
+_HYDRATION_MEDIA_PRIORITY = {"TV": 0, "ONA": 1, "MOVIE": 2, "OVA": 3}
+_HYDRATION_STATUS_PRIORITY = {"ONGOING": 0, "FINISHED": 1, "UPCOMING": 2}
+
+
+def _hydration_priority_key(mid, rec):
+    """Sort key prioritizing airing/finished TV & Movie titles over PVs/specials and unreleased shells."""
+    mtype = str((rec or {}).get("anime_media_type") or "").upper()
+    status = str((rec or {}).get("status") or "").upper()
+    return (
+        _HYDRATION_MEDIA_PRIORITY.get(mtype, 4),
+        _HYDRATION_STATUS_PRIORITY.get(status, 3),
+        -int(mid),
+    )
+
+
 def hydrate_trakt_ids(
     records,
     cache: ApiCache,
@@ -1428,7 +1443,7 @@ def hydrate_trakt_ids(
         mid for mid, r in records.items()
         if not r.get("trakt_id") and (r.get("imdb_id") or r.get("themoviedb_id"))
     ]
-    candidates.sort(reverse=True)
+    candidates.sort(key=lambda mid: _hydration_priority_key(mid, records.get(mid)))
 
     # Pass 1: apply cached Trakt IDs & build in-run dedup memo (0 HTTP calls)
     to_fetch = []
@@ -1677,7 +1692,7 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
             )
         )
     ]
-    priority_ids.sort(reverse=True)
+    priority_ids.sort(key=lambda mid: _hydration_priority_key(mid, records.get(mid)))
 
     # Pass 1: apply already-cached AniZip/MALSync/Simkl payloads across all candidates first (0 HTTP calls),
     # queueing only items needing uncached live API fetches against max_items.
@@ -2291,7 +2306,7 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
             "CREATE TABLE anime ("
             "mal_id INTEGER PRIMARY KEY, mal_dub_id INTEGER, anilist_id INTEGER, "
             "kitsu_id INTEGER, anidb_id INTEGER, simkl_id INTEGER, thetvdb_id INTEGER, "
-            "themoviedb_id INTEGER, imdb_id INTEGER, trakt_id INTEGER, mal_title TEXT, "
+            "themoviedb_id INTEGER, imdb_id INTEGER, trakt_id INTEGER, mal_title TEXT COLLATE NOCASE, "
             "mal_picture TEXT, thetvdb_season INTEGER, thetvdb_part INTEGER, "
             "duration INTEGER, score REAL, status TEXT, anime_media_type TEXT, "
             "global_media_type TEXT, anime_media_episodes TEXT, global_media_episodes TEXT, "
