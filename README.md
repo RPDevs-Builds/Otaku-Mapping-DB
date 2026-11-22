@@ -18,7 +18,8 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
    - **AniList GraphQL** (`graphql.anilist.co` batches of 50): Fills airing/recent/untitled metadata (`format`, `status`, `title`, `episodes`) and `PREQUEL` relation edges.
    - **AniZip** (`api.ani.zip/mappings?mal_id=...`): Direct `thetvdb_id`, `themoviedb_id`, `imdb_id`, episode count, and `seasonNumber` for newly airing shows.
    - **MALSync Rules** (`api.malsync.moe/tvdb/rules/cache-key/...`): Populates split-cour and `absoluteStart` episode rules into `tvdb_rules`.
-   - **Simkl Extended API** (`api.simkl.com`): Fills remaining missing `simkl_id`, `thetvdb_id`, `themoviedb_id`, and `imdb_id` for recent/airing titles (guarded by `ids.mal == mal_id`).
+   - **Simkl Extended API** (`api.simkl.com`) & **Trakt Search API** (`TRAKT_CLIENT_ID`): Fills remaining missing `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, and `trakt_id` (`anime-ids` + IMDb/TMDb resolution).
+   - **AnimeFillerList** (`animefillerlist.com/shows`): Pre-computes non-canon episode intervals (`Filler`, `Mixed Canon/Filler`, `Recap`) mapped cleanly across single-season and `SEQUEL` franchise chains into `filler_ranges`.
    - **Transitive Prequel Inheritance**: Propagates unambiguous franchise `thetvdb_id` / `themoviedb_id` / `imdb_id` down direct TV sequel chains.
 
 ---
@@ -32,7 +33,8 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
   - `anime_aliases`: Compact `WITHOUT ROWID` indexed multi-language alternate titles (`Manami` synonyms, `AniDB` `x-jat`/`en`/`short`, `AniList` English/Romaji/synonyms) for instant offline search and scraper matching (`ix_aliases_title`).
   - `franchise_links`: Compact `WITHOUT ROWID` bidirectional franchise graph (`PREQUEL`, `SEQUEL`, `SIDE_STORY`, `SPIN_OFF`, `PARENT`, `ALTERNATIVE`, `SUMMARY`, `RELATED`) for chronological season/sequel navigation (`ix_franchise_rel`).
   - `schedule_ids`: `syobocal_tid` & `annict_id` Japanese broadcast schedule cross-references from `kawaiioverflow/arm`.
-  - `build_meta`: Schema version, UTC build timestamp, row/rule/alias/franchise totals, and JSON coverage summary.
+  - `filler_ranges`: Compact `WITHOUT ROWID` non-canon episode ranges (`(mal_id, ep_start, ep_end, filler_type)`) for offline `[FILLER]`/`[RECAP]`/`[MIXED]` badges and binge auto-skip (`v2.3`).
+  - `build_meta`: Schema version, UTC build timestamp, row/rule/alias/franchise/filler totals, and JSON coverage summary.
 
 ---
 

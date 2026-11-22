@@ -10,7 +10,8 @@ import re
 import sqlite3
 import sys
 
-REQUIRED_TABLES = ("anime", "activities", "tvdb_rules", "anime_aliases", "franchise_links", "schedule_ids", "build_meta")
+REQUIRED_TABLES = ("anime", "activities", "tvdb_rules", "anime_aliases", "franchise_links", "schedule_ids", "filler_ranges", "build_meta")
+_VALID_FILLER_TYPES = ("Filler", "Mixed Canon/Filler", "Recap")
 REQUIRED_COLUMNS = (
     "mal_id", "mal_dub_id", "anilist_id", "kitsu_id", "anidb_id", "simkl_id",
     "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_title", "mal_picture",
@@ -175,6 +176,32 @@ def validate_database(
             ).fetchone()[0]
             if dangling_sc:
                 errors.append(f"schedule_ids contains {dangling_sc} dangling mal_id references")
+
+        if "filler_ranges" in tables:
+            p_txt = " | ".join(
+                str(r[-1])
+                for r in conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id = ?",
+                    (1,),
+                ).fetchall()
+            )
+            if "SCAN filler_ranges" in p_txt and "USING " not in p_txt:
+                errors.append(f"Missing/unused primary key index for filler_ranges.mal_id: query plan = '{p_txt}'")
+            dangling_fr_r = conn.execute(
+                "SELECT COUNT(*) FROM filler_ranges f WHERE NOT EXISTS (SELECT 1 FROM anime m WHERE m.mal_id = f.mal_id)"
+            ).fetchone()[0]
+            if dangling_fr_r:
+                errors.append(f"filler_ranges contains {dangling_fr_r} dangling mal_id references")
+            bad_bounds = conn.execute(
+                "SELECT COUNT(*) FROM filler_ranges WHERE ep_start < 1 OR ep_end < ep_start"
+            ).fetchone()[0]
+            if bad_bounds:
+                errors.append(f"filler_ranges contains {bad_bounds} invalid episode bounds")
+            bad_types = conn.execute(
+                "SELECT COUNT(*) FROM filler_ranges WHERE filler_type NOT IN ('Filler', 'Mixed Canon/Filler', 'Recap')"
+            ).fetchone()[0]
+            if bad_types:
+                errors.append(f"filler_ranges contains {bad_types} invalid filler_type values")
 
         # Baseline monotone coverage comparison (ignoring empty phantom seed shells > 64000)
         if baseline_path and os.path.isfile(baseline_path):

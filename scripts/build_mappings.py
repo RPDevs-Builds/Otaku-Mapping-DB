@@ -14,6 +14,7 @@ import collections
 import datetime
 import gzip
 import hashlib
+import html as html_lib
 import json
 import lzma
 import os
@@ -26,7 +27,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-SCHEMA_VERSION = "2.2"
+SCHEMA_VERSION = "2.3"
 
 SOURCE_URLS = {
     "fribb": "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json",
@@ -36,6 +37,7 @@ SOURCE_URLS = {
     "mal_dubs": "https://raw.githubusercontent.com/MAL-Dubs/MAL-Dubs/main/data/dubInfo.json",
     "kometa": "https://raw.githubusercontent.com/Kometa-Team/Anime-IDs/master/anime_ids.json",
     "anidb_titles": "https://anidb.net/api/anime-titles.xml.gz",
+    "animefillerlist": "https://www.animefillerlist.com/shows",
 }
 
 WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
@@ -249,6 +251,16 @@ def _http_get_bytes(url, headers=None, timeout=30, retries=2):
                 pass
             if err_code in (304, 404, 400):
                 return b"", err_code, err_hdrs
+            if err_code == 429:
+                retry_after = err_hdrs.get("Retry-After")
+                try:
+                    wait_s = min(5.0, max(0.5, float(retry_after or 2.0)))
+                except (TypeError, ValueError):
+                    wait_s = 2.0
+                if attempt < retries:
+                    time.sleep(wait_s)
+                    continue
+                return b"", 429, err_hdrs
             last_exc = exc
         except Exception as exc:
             last_exc = exc
@@ -1041,44 +1053,60 @@ def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100,
                         records[mid]["trakt_id"] = tid
         return
 
-    if not TRAKT_CLIENT_ID:
-        return
-
     candidates = [
         mid for mid, r in records.items()
         if not r.get("trakt_id") and (r.get("imdb_id") or r.get("themoviedb_id"))
     ]
     candidates.sort(reverse=True)
+
+    # Pass 1: apply cached Trakt IDs without spending HTTP quota
+    to_fetch = []
+    for mid in candidates:
+        tid = cache.get("trakt", mid, max_age_seconds=30 * 86400)
+        if tid is None:
+            to_fetch.append(mid)
+        elif parse_pos_int(tid) and not records[mid]["trakt_id"]:
+            records[mid]["trakt_id"] = int(tid)
+
+    if not TRAKT_CLIENT_ID:
+        return
+
     headers = {
         "Content-Type": "application/json",
         "trakt-api-version": "2",
         "trakt-api-key": TRAKT_CLIENT_ID,
     }
-    for mid in candidates[:max_items]:
+    rate_limit_hits = 0
+    for mid in to_fetch[:max_items]:
         if deadline and time.time() >= deadline:
             break
         rec = records[mid]
-        tid = cache.get("trakt", mid, max_age_seconds=30 * 86400)
-        if tid is None:
-            tid = 0
-            try:
-                imdb = rec.get("imdb_id")
-                url = (
-                    f"https://api.trakt.tv/search/imdb/{urllib.parse.quote(imdb)}?type=show,movie"
-                    if imdb
-                    else f"https://api.trakt.tv/search/tmdb/{rec['themoviedb_id']}?type={'movie' if rec.get('global_media_type') == 'movie' else 'show'}"
-                )
-                raw, status, _ = _http_get_bytes(url, headers=headers, timeout=10, retries=1)
-                if status == 200 and raw:
-                    arr = json.loads(raw.decode("utf-8"))
-                    if isinstance(arr, list) and arr:
-                        entry = arr[0]
-                        obj = entry.get("show") or entry.get("movie") or {}
-                        tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
+        tid = 0
+        try:
+            imdb = rec.get("imdb_id")
+            url = (
+                f"https://api.trakt.tv/search/imdb/{urllib.parse.quote(imdb)}?type=show,movie"
+                if imdb
+                else f"https://api.trakt.tv/search/tmdb/{rec['themoviedb_id']}?type={'movie' if rec.get('global_media_type') == 'movie' else 'show'}"
+            )
+            raw, status, _ = _http_get_bytes(url, headers=headers, timeout=10, retries=1)
+            if status == 429:
+                rate_limit_hits += 1
+                if rate_limit_hits >= 3:
+                    break
+                time.sleep(1.5)
+                continue
+            if status == 200 and raw:
+                arr = json.loads(raw.decode("utf-8"))
+                if isinstance(arr, list) and arr:
+                    entry = arr[0]
+                    obj = entry.get("show") or entry.get("movie") or {}
+                    tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
+            if status in (200, 404, 400):
                 cache.set("trakt", mid, tid)
-                time.sleep(0.2)
-            except Exception:
-                cache.set("trakt", mid, 0)
+            time.sleep(0.25)
+        except Exception:
+            cache.set("trakt", mid, 0)
         if parse_pos_int(tid) and not rec["trakt_id"]:
             rec["trakt_id"] = int(tid)
 
@@ -1198,17 +1226,45 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
         )
     ]
     priority_ids.sort(reverse=True)
-    budget_ids = priority_ids[:max_items]
 
-    for mid in budget_ids:
+    # Pass 1: apply already-cached AniZip/MALSync/Simkl payloads across all candidates first (0 HTTP calls),
+    # queueing only items needing uncached live API fetches against max_items.
+    uncached_queue = []
+    for mid in priority_ids:
+        rec = records[mid]
+        ttl = 2 * 86400 if rec.get("status") in ("ONGOING", "UPCOMING") else 21 * 86400
+        need_az = cache.get("anizip", mid, max_age_seconds=ttl)
+        if isinstance(need_az, dict) and need_az:
+            _apply_anizip(records, mid, need_az, ep_counts)
+
+        need_ms = {} if rec.get("anime_media_type") not in ("TV", "ONA") else cache.get("malsync_rules", mid, max_age_seconds=ttl)
+        if isinstance(need_ms, dict) and need_ms:
+            extra_rules.extend(_apply_malsync_rules(records, mid, need_ms))
+
+        need_simkl_check = (
+            bool(SIMKL_CLIENT_ID)
+            and (
+                not rec.get("thetvdb_id")
+                or not rec.get("themoviedb_id")
+                or not rec.get("imdb_id")
+                or not rec.get("simkl_id")
+            )
+        )
+        need_sk = {} if not need_simkl_check else cache.get("simkl", mid, max_age_seconds=ttl)
+        if isinstance(need_sk, dict) and need_sk:
+            _apply_simkl(records, mid, need_sk, ep_counts)
+
+        if need_az is None or need_ms is None or (need_simkl_check and need_sk is None):
+            uncached_queue.append((mid, need_az is None, need_ms is None, need_simkl_check and need_sk is None, ttl))
+
+    for mid, fetch_az, fetch_ms, fetch_sk, _ttl in uncached_queue[:max_items]:
         if deadline and time.time() >= deadline:
             break
         rec = records[mid]
-        ttl = 2 * 86400 if rec.get("status") in ("ONGOING", "UPCOMING") else 21 * 86400
 
         # 1. AniZip mappings
-        az = cache.get("anizip", mid, max_age_seconds=ttl)
-        if az is None:
+        if fetch_az:
+            az = {}
             try:
                 raw, status, _ = _http_get_bytes(f"https://api.ani.zip/mappings?mal_id={mid}", timeout=12, retries=1)
                 az = json.loads(raw.decode("utf-8")) if (status == 200 and raw) else {}
@@ -1216,42 +1272,40 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
                 time.sleep(0.25)
             except Exception:
                 az = {}
-        if isinstance(az, dict) and az:
-            _apply_anizip(records, mid, az, ep_counts)
+            if isinstance(az, dict) and az:
+                _apply_anizip(records, mid, az, ep_counts)
 
         # 2. MALSync TVDB/cour rules
         if deadline and time.time() >= deadline:
             break
-        if rec.get("anime_media_type") in ("TV", "ONA"):
-            ms = cache.get("malsync_rules", mid, max_age_seconds=ttl)
-            if ms is None:
-                try:
-                    raw, status, _ = _http_get_bytes(f"https://api.malsync.moe/tvdb/rules/cache-key/{mid}", timeout=12, retries=1)
-                    ms = json.loads(raw.decode("utf-8")) if (status == 200 and raw) else {}
-                    cache.set("malsync_rules", mid, ms)
-                    time.sleep(0.2)
-                except Exception:
-                    ms = {}
+        if fetch_ms and rec.get("anime_media_type") in ("TV", "ONA"):
+            ms = {}
+            try:
+                raw, status, _ = _http_get_bytes(f"https://api.malsync.moe/tvdb/rules/cache-key/{mid}", timeout=12, retries=1)
+                ms = json.loads(raw.decode("utf-8")) if (status == 200 and raw) else {}
+                cache.set("malsync_rules", mid, ms)
+                time.sleep(0.2)
+            except Exception:
+                ms = {}
             if isinstance(ms, dict) and ms:
                 extra_rules.extend(_apply_malsync_rules(records, mid, ms))
 
         # 3. Simkl fallback when TVDB/TMDB/IMDb/Simkl ID still missing
         if deadline and time.time() >= deadline:
             break
-        if SIMKL_CLIENT_ID and (
+        if fetch_sk and SIMKL_CLIENT_ID and (
             not rec.get("thetvdb_id")
             or not rec.get("themoviedb_id")
             or not rec.get("imdb_id")
             or not rec.get("simkl_id")
         ):
-            sk = cache.get("simkl", mid, max_age_seconds=ttl)
-            if sk is None:
-                try:
-                    sk = _fetch_simkl_record(mid, rec.get("simkl_id"))
-                    cache.set("simkl", mid, sk)
-                    time.sleep(0.2)
-                except Exception:
-                    sk = {}
+            sk = {}
+            try:
+                sk = _fetch_simkl_record(mid, rec.get("simkl_id"))
+                cache.set("simkl", mid, sk)
+                time.sleep(0.2)
+            except Exception:
+                sk = {}
             if isinstance(sk, dict) and sk:
                 _apply_simkl(records, mid, sk, ep_counts)
 
@@ -1328,6 +1382,248 @@ def _apply_malsync_rules(records, mal_id, ms):
             "source": "malsync_rules",
         })
     return out_rules
+
+
+_VALID_FILLER_TYPES = ("Filler", "Mixed Canon/Filler", "Recap")
+_RE_AFL_H1 = re.compile(r"<h1[^>]*>(.*?)</h1>", re.S | re.I)
+_RE_AFL_EP_TABLE = re.compile(r'<table[^>]*class="[^"]*EpisodeList[^"]*"[^>]*>(.*?)</table>', re.S | re.I)
+_RE_AFL_EP_ROW = re.compile(
+    r'<tr[^>]*>.*?<td[^>]*class="[^"]*Number[^"]*"[^>]*>\s*(\d+)\s*</td>.*?'
+    r'<td[^>]*class="[^"]*Type[^"]*"[^>]*>\s*<span[^>]*>(.*?)</span>',
+    re.S | re.I,
+)
+_RE_AFL_SHOW_LINK = re.compile(r'href="(/shows/([a-z0-9-]+))"', re.I)
+_RE_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _classify_afl_filler(raw_type):
+    if not raw_type:
+        return ""
+    low = str(raw_type).strip().lower()
+    if "recap" in low:
+        return "Recap"
+    if "mixed" in low or "canon/filler" in low:
+        return "Mixed Canon/Filler"
+    if "filler" in low:
+        return "Filler"
+    return ""
+
+
+def _norm_afl_title(title):
+    if not title:
+        return ""
+    clean = re.sub(r"<[^>]+>", "", html_lib.unescape(str(title)))
+    clean = re.sub(r"\s*filler\s+list\s*$", "", clean, flags=re.I)
+    return _RE_NON_ALNUM.sub(" ", clean.lower()).strip()
+
+
+def _parse_afl_directory_html(raw_html):
+    seen = set()
+    slugs = []
+    for _path, slug in _RE_AFL_SHOW_LINK.findall(raw_html or ""):
+        s = slug.strip().lower()
+        if s and s not in seen:
+            seen.add(s)
+            slugs.append(s)
+    return slugs
+
+
+def _parse_afl_show_html(raw_html, slug=""):
+    m_h1 = _RE_AFL_H1.search(raw_html or "")
+    title = _norm_afl_title(m_h1.group(1)) if m_h1 else _norm_afl_title(slug.replace("-", " "))
+    m_tbl = _RE_AFL_EP_TABLE.search(raw_html or "")
+    body = m_tbl.group(1) if m_tbl else (raw_html or "")
+    max_ep = 0
+    non_canon = {}
+    for num_s, raw_type in _RE_AFL_EP_ROW.findall(body):
+        ep = parse_pos_int(num_s)
+        if not ep:
+            continue
+        if ep > max_ep:
+            max_ep = ep
+        ftype = _classify_afl_filler(raw_type)
+        if ftype:
+            non_canon[str(ep)] = ftype
+    return {"slug": slug, "title": title, "max_ep": max_ep, "episodes": non_canon}
+
+
+def _coalesce_filler_ranges(per_ep_entries):
+    """Collapse sorted (mal_id, episode, filler_type) tuples into contiguous (mal_id, ep_start, ep_end, filler_type)."""
+    ranges = []
+    if not per_ep_entries:
+        return ranges
+    ordered = sorted(set(per_ep_entries), key=lambda x: (x[0], x[1], x[2]))
+    cur_mid, cur_start, cur_end, cur_type = ordered[0][0], ordered[0][1], ordered[0][1], ordered[0][2]
+    for mid, ep, ftype in ordered[1:]:
+        if mid == cur_mid and ftype == cur_type and ep == cur_end + 1:
+            cur_end = ep
+        elif mid == cur_mid and ftype == cur_type and ep == cur_end:
+            continue
+        else:
+            ranges.append((cur_mid, cur_start, cur_end, cur_type))
+            cur_mid, cur_start, cur_end, cur_type = mid, ep, ep, ftype
+    ranges.append((cur_mid, cur_start, cur_end, cur_type))
+    return ranges
+
+
+def _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_counts):
+    """Align parsed AnimeFillerList show payloads to MAL IDs and sequel chains, returning coalesced filler_ranges."""
+    title_index = collections.defaultdict(list)
+    prequel_set = {
+        mid for (mid, _rel, rtype) in (franchise_links or {})
+        if rtype == "PREQUEL"
+    }
+
+    def _register_title(mid, raw_t, prio):
+        norm = _norm_afl_title(raw_t)
+        if not norm or mid not in records:
+            return
+        rec = records[mid]
+        mtype = rec.get("anime_media_type") or ""
+        if mtype in ("MOVIE", "MUSIC"):
+            return
+        rank = (
+            0 if mtype in ("TV", "ONA") else 1,
+            prio,
+            1 if mid in prequel_set else 0,
+            0 if rec.get("thetvdb_id") else 1,
+            mid,
+        )
+        title_index[norm].append((rank, mid))
+
+    for mid, rec in records.items():
+        _register_title(mid, rec.get("mal_title"), 0)
+    for (mid, _norm), (clean_t, ttype) in (aliases_map or {}).items():
+        _register_title(mid, clean_t, _ALIAS_PRIORITY.get(ttype, 4))
+
+    sequel_adj = collections.defaultdict(list)
+    for (mid, rel_mid, rtype), src in (franchise_links or {}).items():
+        if rtype != "SEQUEL" or mid not in records or rel_mid not in records or mid == rel_mid:
+            continue
+        if records[rel_mid].get("anime_media_type") not in ("TV", "ONA"):
+            continue
+        if (ep_counts.get(rel_mid) or 0) <= 0:
+            continue
+        sequel_adj[mid].append((0 if str(src).startswith("anilist") else 1, rel_mid))
+
+    per_ep_entries = []
+    matched_shows = 0
+    for show in shows:
+        ep_map = show.get("episodes") or {}
+        if not ep_map:
+            continue
+        slug = str(show.get("slug") or "").strip().lower()
+        cand_norms = [
+            _norm_afl_title(show.get("title")),
+            _norm_afl_title(slug.replace("-", " ")),
+        ]
+        cands = []
+        for norm in cand_norms:
+            if norm and norm in title_index:
+                cands.extend(title_index[norm])
+        if not cands:
+            continue
+        cands.sort(key=lambda x: x[0])
+        root_mid = cands[0][1]
+        matched_shows += 1
+
+        max_ep = parse_pos_int(show.get("max_ep")) or max(int(k) for k in ep_map)
+        root_eps = ep_counts.get(root_mid) or 0
+        spans = []
+        if root_eps >= max_ep - 2 or not sequel_adj.get(root_mid):
+            spans.append((1, max(max_ep, root_eps), root_mid))
+        else:
+            chain = [root_mid]
+            seen_chain = {root_mid}
+            cur = root_mid
+            while len(chain) < 12:
+                nexts = [r for _, r in sorted(sequel_adj.get(cur, [])) if r not in seen_chain]
+                if not nexts:
+                    break
+                nxt = nexts[0]
+                chain.append(nxt)
+                seen_chain.add(nxt)
+                cur = nxt
+            cursor = 1
+            for cmid in chain:
+                ceps = ep_counts.get(cmid) or 0
+                if ceps <= 0:
+                    break
+                spans.append((cursor, cursor + ceps - 1, cmid))
+                cursor += ceps
+
+        for ep_s, ftype in ep_map.items():
+            ep_i = parse_pos_int(ep_s)
+            if not ep_i or ftype not in _VALID_FILLER_TYPES:
+                continue
+            for sp_start, sp_end, sp_mid in spans:
+                if sp_start <= ep_i <= sp_end:
+                    per_ep_entries.append((sp_mid, ep_i - sp_start + 1, ftype))
+                    break
+
+    return _coalesce_filler_ranges(per_ep_entries), matched_shows
+
+
+def hydrate_and_map_filler_ranges(records, aliases_map, franchise_links, cache: ApiCache, ep_counts, offline_dir=None, deadline=0.0):
+    """Fetch/cache AnimeFillerList show tags and map non-canon episodes to coalesced filler_ranges."""
+    if offline_dir:
+        fix = os.path.join(offline_dir, "animefillerlist.json")
+        if not os.path.isfile(fix):
+            return [], 0
+        with open(fix, "r", encoding="utf-8") as f:
+            raw_items = json.load(f)
+        shows = []
+        for entry in raw_items or ():
+            if not isinstance(entry, dict):
+                continue
+            if "html" in entry:
+                shows.append(_parse_afl_show_html(entry["html"], entry.get("slug", "")))
+            else:
+                shows.append({
+                    "slug": entry.get("slug", ""),
+                    "title": entry.get("title", ""),
+                    "max_ep": entry.get("max_ep") or 0,
+                    "episodes": entry.get("episodes") or {},
+                })
+        return _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_counts)
+
+    slugs = cache.get("afl", "_directory", max_age_seconds=7 * 86400)
+    if slugs is None:
+        try:
+            raw, status, _ = _http_get_bytes(SOURCE_URLS["animefillerlist"], timeout=15, retries=1)
+            slugs = _parse_afl_directory_html(raw.decode("utf-8", "ignore")) if (status == 200 and raw) else []
+            if slugs:
+                cache.set("afl", "_directory", slugs)
+        except Exception:
+            slugs = []
+    if not isinstance(slugs, list) or not slugs:
+        return [], 0
+
+    shows = []
+    to_fetch = []
+    for slug in slugs:
+        cached_show = cache.get("afl", f"show_{slug}", max_age_seconds=21 * 86400)
+        if isinstance(cached_show, dict):
+            shows.append(cached_show)
+        else:
+            to_fetch.append(slug)
+
+    for slug in to_fetch:
+        if deadline and time.time() >= deadline:
+            break
+        try:
+            raw, status, _ = _http_get_bytes(f"{SOURCE_URLS['animefillerlist']}/{slug}", timeout=12, retries=1)
+            if status == 200 and raw:
+                parsed = _parse_afl_show_html(raw.decode("utf-8", "ignore"), slug=slug)
+                cache.set("afl", f"show_{slug}", parsed)
+                shows.append(parsed)
+            elif status == 404:
+                cache.set("afl", f"show_{slug}", {"slug": slug, "title": "", "max_ep": 0, "episodes": {}})
+            time.sleep(0.1)
+        except Exception:
+            continue
+
+    return _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_counts)
 
 
 def apply_prequel_inheritance(records, prequel_edges, manami_related):
@@ -1432,7 +1728,7 @@ def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None
     return pruned
 
 
-def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, franchise_links=None, schedule_ids=None):
+def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, franchise_links=None, schedule_ids=None, filler_ranges=None, filler_shows=0):
     """Write normalized anime_mappings.db, build indexes, run ANALYZE + VACUUM."""
     out_dir = os.path.dirname(os.path.abspath(output_path))
     if out_dir:
@@ -1479,6 +1775,12 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
         conn.execute(
             "CREATE TABLE schedule_ids ("
             "mal_id INTEGER PRIMARY KEY, syobocal_tid INTEGER, annict_id INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE filler_ranges ("
+            "mal_id INTEGER NOT NULL, ep_start INTEGER NOT NULL, "
+            "ep_end INTEGER NOT NULL, filler_type TEXT NOT NULL, "
+            "PRIMARY KEY (mal_id, ep_start, ep_end)) WITHOUT ROWID"
         )
         conn.execute("CREATE TABLE build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
@@ -1544,6 +1846,17 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
                 sched_rows,
             )
 
+        clean_filler_rows = [
+            (mid, s, e, ft)
+            for (mid, s, e, ft) in (filler_ranges or [])
+            if mid in records and s >= 1 and e >= s and ft in _VALID_FILLER_TYPES
+        ]
+        if clean_filler_rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO filler_ranges (mal_id, ep_start, ep_end, filler_type) VALUES (?, ?, ?, ?)",
+                clean_filler_rows,
+            )
+
         meta_rows = [
             ("schema_version", SCHEMA_VERSION),
             ("built_at_utc", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
@@ -1552,6 +1865,8 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
             ("alias_count", str(len(alias_rows))),
             ("franchise_link_count", str(len(link_rows))),
             ("schedule_id_count", str(len(sched_rows))),
+            ("filler_range_count", str(len(clean_filler_rows))),
+            ("filler_show_count", str(int(filler_shows or 0))),
             ("coverage_json", json.dumps(stats)),
         ]
         conn.executemany("INSERT INTO build_meta (key, value) VALUES (?, ?)", meta_rows)
@@ -1582,7 +1897,7 @@ def compute_stats(records):
         counts[col] = sum(1 for r in records.values() if r.get(col) not in (None, ""))
     recent = [r for mid, r in records.items() if mid >= 55000]
     counts["recent_total"] = len(recent)
-    for col in ("anilist_id", "kitsu_id", "anidb_id", "simkl_id", "thetvdb_id", "themoviedb_id", "imdb_id", "mal_dub_id"):
+    for col in ("anilist_id", "kitsu_id", "anidb_id", "simkl_id", "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_dub_id"):
         counts[f"recent_{col}"] = sum(1 for r in recent if r.get(col) not in (None, ""))
     return {"total_rows": total, "columns": counts}
 
@@ -1657,38 +1972,28 @@ def build_pipeline(args):
 
     extra_rules = []
     prequel_edges = {}
+    wall_deadline = 0.0
     if args.api_budget_seconds > 0 or args.offline_fixtures:
         wall_deadline = time.time() + args.api_budget_seconds if not args.offline_fixtures else 0.0
+        # Reserve up to ~30% of live wall budget (capped at 95s) when AFL cache needs initial warming
+        afl_reserve = min(95.0, args.api_budget_seconds * 0.30) if (not args.offline_fixtures and args.api_budget_seconds > 30) else 0.0
+        api_deadline = (wall_deadline - afl_reserve) if wall_deadline else 0.0
         prequel_edges = hydrate_anilist_relations(
             records, cache, ep_counts, args.offline_fixtures,
-            deadline=wall_deadline, franchise_links=franchise_links, aliases_map=aliases_map,
+            deadline=api_deadline, franchise_links=franchise_links, aliases_map=aliases_map,
         )
         extra_rules = hydrate_anizip_and_malsync(
-            records, cache, ep_counts, args.offline_fixtures, max_items=args.max_api_items, deadline=wall_deadline
+            records, cache, ep_counts, args.offline_fixtures, max_items=args.max_api_items, deadline=api_deadline
         )
         hydrate_trakt_ids(
             records, cache, args.offline_fixtures,
-            max_items=min(100, args.max_api_items), deadline=wall_deadline,
+            max_items=min(800, args.max_api_items), deadline=api_deadline,
         )
 
     apply_prequel_inheritance(records, prequel_edges, manami_related)
     pruned_shells = finalize_parts_and_uniqueness(records, seed_ids=seed_ids, canonical_mal_ids=manami_mal_ids)
 
-    # Filter alternate aliases (skip canonical mal_title already stored on anime.mal_title, max 3 alternates per show)
-    per_show_aliases = collections.defaultdict(list)
-    primary_norms = {mid: _norm_alias(rec.get("mal_title")) for mid, rec in records.items()}
-    for (mid, norm), (clean_t, ttype) in aliases_map.items():
-        if mid not in records or norm == primary_norms.get(mid):
-            continue
-        per_show_aliases[mid].append((_ALIAS_PRIORITY.get(ttype, 5), norm, clean_t, ttype))
-    slim_aliases = {}
-    for mid, items in per_show_aliases.items():
-        items.sort(key=lambda x: (x[0], len(x[2])))
-        for _, norm, clean_t, ttype in items[:3]:
-            slim_aliases[(mid, norm)] = (clean_t, ttype)
-    aliases_map = slim_aliases
-
-    # Add symmetric inverse PREQUEL <-> SEQUEL edges + Manami RELATED fallback
+    # Add symmetric inverse PREQUEL <-> SEQUEL edges + Manami RELATED fallback before AFL chain mapping
     explicit_pairs = set()
     inv_additions = {}
     for (mid, rel_mid, rtype), src in franchise_links.items():
@@ -1709,16 +2014,41 @@ def build_pipeline(args):
             if rel_mid in records and rel_mid != mid and (mid, rel_mid) not in explicit_pairs:
                 franchise_links.setdefault((mid, rel_mid, "RELATED"), "manami")
 
+    # Map AnimeFillerList ranges using full pre-trimmed aliases & complete SEQUEL chains
+    filler_ranges = []
+    filler_shows = 0
+    if args.api_budget_seconds > 0 or args.offline_fixtures:
+        filler_ranges, filler_shows = hydrate_and_map_filler_ranges(
+            records, aliases_map, franchise_links, cache, ep_counts,
+            offline_dir=args.offline_fixtures, deadline=wall_deadline,
+        )
+
+    # Filter alternate aliases (skip canonical mal_title already stored on anime.mal_title, max 3 alternates per show)
+    per_show_aliases = collections.defaultdict(list)
+    primary_norms = {mid: _norm_alias(rec.get("mal_title")) for mid, rec in records.items()}
+    for (mid, norm), (clean_t, ttype) in aliases_map.items():
+        if mid not in records or norm == primary_norms.get(mid):
+            continue
+        per_show_aliases[mid].append((_ALIAS_PRIORITY.get(ttype, 5), norm, clean_t, ttype))
+    slim_aliases = {}
+    for mid, items in per_show_aliases.items():
+        items.sort(key=lambda x: (x[0], len(x[2])))
+        for _, norm, clean_t, ttype in items[:3]:
+            slim_aliases[(mid, norm)] = (clean_t, ttype)
+    aliases_map = slim_aliases
+
     # Trim collections to surviving records for exact manifest counts
     aliases_map = {k: v for k, v in aliases_map.items() if k[0] in records}
     franchise_links = {k: v for k, v in franchise_links.items() if k[0] in records and k[1] in records and k[0] != k[1]}
     schedule_ids = {k: v for k, v in schedule_ids.items() if k in records and (v[0] or v[1])}
+    filler_ranges = [r for r in filler_ranges if r[0] in records]
 
     all_rules = xml_rules + extra_rules
     stats = compute_stats(records)
     write_sqlite_database(
         args.output, records, all_rules, stats,
         aliases_map=aliases_map, franchise_links=franchise_links, schedule_ids=schedule_ids,
+        filler_ranges=filler_ranges, filler_shows=filler_shows,
     )
 
     raw_size = os.path.getsize(args.output)
@@ -1748,6 +2078,8 @@ def build_pipeline(args):
         "alias_count": len(aliases_map),
         "franchise_link_count": len(franchise_links),
         "schedule_id_count": len(schedule_ids),
+        "filler_range_count": len(filler_ranges),
+        "filler_show_count": filler_shows,
         "build_seconds": round(time.perf_counter() - t0, 2),
         "files": {
             "raw": {
@@ -1784,14 +2116,15 @@ def build_pipeline(args):
             f"**TVDB/Cour Rules**: `{manifest['rule_count']:,}` | "
             f"**Aliases**: `{manifest['alias_count']:,}` | "
             f"**Franchise Links**: `{manifest['franchise_link_count']:,}` | "
-            f"**Schedule IDs**: `{manifest['schedule_id_count']:,}`\n"
+            f"**Schedule IDs**: `{manifest['schedule_id_count']:,}` | "
+            f"**Filler Ranges**: `{manifest['filler_range_count']:,}` (`{manifest['filler_show_count']:,}` shows)\n"
             f"- **Archives**: {xz_note}`anime_mappings.db` (`{raw_size:,}` bytes)\n"
             f"- **Coverage**: `anilist_id={c['anilist_id']:,}`, `kitsu_id={c['kitsu_id']:,}`, "
             f"`anidb_id={c['anidb_id']:,}`, `simkl_id={c['simkl_id']:,}`, `thetvdb_id={c['thetvdb_id']:,}`, "
             f"`themoviedb_id={c['themoviedb_id']:,}`, `imdb_id={c['imdb_id']:,}`, `trakt_id={c['trakt_id']:,}`, `mal_dub_id={c['mal_dub_id']:,}`\n"
             f"- **Recent (`mal_id >= 55000`, n=`{c['recent_total']:,}`)**: "
             f"`thetvdb_id={c['recent_thetvdb_id']:,}`, `themoviedb_id={c['recent_themoviedb_id']:,}`, "
-            f"`anidb_id={c['recent_anidb_id']:,}`\n"
+            f"`anidb_id={c['recent_anidb_id']:,}`, `trakt_id={c['recent_trakt_id']:,}`\n"
         )
         with open(notes_path, "w", encoding="utf-8") as nf:
             nf.write(notes_text)

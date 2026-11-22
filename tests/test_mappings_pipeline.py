@@ -234,6 +234,34 @@ class TestMappingsPipeline(unittest.TestCase):
         with open(os.path.join(fdir, "trakt_items.json"), "w", encoding="utf-8") as f:
             json.dump({"500": {"trakt_id": 99500}}, f)
 
+        afl_items = [
+            {
+                "slug": "test-saga",
+                "title": "Test Saga Season 1",
+                "max_ep": 24,
+                "episodes": {
+                    "5": "Mixed Canon/Filler",
+                    "14": "Filler",
+                    "15": "Filler",
+                    "16": "Recap",
+                },
+            },
+            {
+                "slug": "simkl-hydrated-show",
+                "html": (
+                    "<h1>Simkl Hydrated Show Filler List</h1>"
+                    '<table class="EpisodeList"><tbody>'
+                    '<tr><td class="Number">1</td><td class="Title">Canon</td><td class="Type"><span>Manga Canon</span></td></tr>'
+                    '<tr><td class="Number">2</td><td class="Title">Beach</td><td class="Type"><span>Filler</span></td></tr>'
+                    '<tr><td class="Number">3</td><td class="Title">Pool</td><td class="Type"><span>Mostly Filler</span></td></tr>'
+                    '<tr><td class="Number">4</td><td class="Title">Summary</td><td class="Type"><span>Recap</span></td></tr>'
+                    "</tbody></table>"
+                ),
+            },
+        ]
+        with open(os.path.join(fdir, "animefillerlist.json"), "w", encoding="utf-8") as f:
+            json.dump(afl_items, f)
+
     def test_hermetic_build_inheritance_indexes_and_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             seed_p = os.path.join(tmp, "seed.db")
@@ -335,6 +363,17 @@ class TestMappingsPipeline(unittest.TestCase):
                 sources = {r["source"] for r in rules}
                 self.assertIn("anime_lists_xml", sources)
                 self.assertIn("malsync_rules", sources)
+
+                # 8. filler_ranges maps multi-season SEQUEL chain & coalesces HTML intervals
+                fr_100 = conn.execute("SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id=100 ORDER BY ep_start").fetchall()
+                self.assertEqual([tuple(r) for r in fr_100], [(5, 5, "Mixed Canon/Filler")])
+                fr_200 = conn.execute("SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id=200 ORDER BY ep_start").fetchall()
+                self.assertEqual([tuple(r) for r in fr_200], [(2, 3, "Filler"), (4, 4, "Recap")])
+                fr_500 = conn.execute("SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id=500 ORDER BY ep_start").fetchall()
+                self.assertEqual([tuple(r) for r in fr_500], [(2, 3, "Filler"), (4, 4, "Recap")])
+                self.assertEqual(manifest["schema_version"], "2.3")
+                self.assertEqual(manifest["filler_show_count"], 2)
+                self.assertEqual(manifest["filler_range_count"], 5)
             finally:
                 conn.close()
 
@@ -355,10 +394,12 @@ class TestMappingsPipeline(unittest.TestCase):
             conn.execute("CREATE TABLE anime_aliases (mal_id INTEGER, title TEXT)")
             conn.execute("CREATE TABLE franchise_links (mal_id INTEGER, related_mal_id INTEGER, relation_type TEXT, source TEXT)")
             conn.execute("CREATE TABLE schedule_ids (mal_id INTEGER PRIMARY KEY, syobocal_tid INTEGER, annict_id INTEGER)")
+            conn.execute("CREATE TABLE filler_ranges (mal_id INTEGER NOT NULL, ep_start INTEGER NOT NULL, ep_end INTEGER NOT NULL, filler_type TEXT NOT NULL, PRIMARY KEY (mal_id, ep_start, ep_end)) WITHOUT ROWID")
             conn.execute("CREATE TABLE build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.execute("INSERT INTO anime (mal_id, thetvdb_id, imdb_id) VALUES (1, 'movie', 'bad_imdb')")
             conn.execute("INSERT INTO anime (mal_id) VALUES (66863)")
             conn.execute("INSERT INTO franchise_links VALUES (1, 999999, 'SEQUEL', 'anilist')")
+            conn.execute("INSERT INTO filler_ranges VALUES (1, 5, 2, 'InvalidType')")
             conn.commit()
             conn.close()
 
@@ -369,6 +410,28 @@ class TestMappingsPipeline(unittest.TestCase):
             self.assertIn("empty orphan rows", joined)
             self.assertIn("dangling mal_id references", joined)
             self.assertIn("Missing/unused index for themoviedb_id", joined)
+            self.assertIn("invalid episode bounds", joined)
+            self.assertIn("invalid filler_type values", joined)
+
+    def test_hydrate_trakt_ids_skips_cached_misses_to_fetch_uncached_backlog(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = build_mappings.ApiCache(tmp)
+            cache.set("trakt", 900, 0)
+            cache.set("trakt", 800, 4444)
+            records = {
+                900: build_mappings.empty_record(900) | {"imdb_id": "tt0000900"},
+                800: build_mappings.empty_record(800) | {"imdb_id": "tt0000800"},
+                700: build_mappings.empty_record(700) | {"imdb_id": "tt0000700"},
+            }
+            payload = json.dumps([{"show": {"ids": {"trakt": 7777}}}]).encode("utf-8")
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                 mock.patch.object(build_mappings, "TRAKT_CLIENT_ID", "test_cid"), \
+                 mock.patch.object(build_mappings, "_http_get_bytes", return_value=(payload, 200, {})) as mock_get:
+                build_mappings.hydrate_trakt_ids(records, cache, max_items=1)
+            self.assertEqual(records[800]["trakt_id"], 4444)
+            self.assertEqual(records[700]["trakt_id"], 7777)
+            self.assertEqual(mock_get.call_count, 1)
 
 
 if __name__ == "__main__":
