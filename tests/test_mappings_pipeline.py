@@ -60,6 +60,7 @@ class TestMappingsPipeline(unittest.TestCase):
                     "type": "TV",
                     "episodes": 12,
                     "status": "FINISHED",
+                    "animeSeason": {"year": 2023, "season": "FALL"},
                     "picture": "https://cdn.myanimelist.net/images/anime/12/34567.jpg",
                     "duration": {"value": 1440, "unit": "SECONDS"},
                     "score": {"median": 8.456},
@@ -97,6 +98,42 @@ class TestMappingsPipeline(unittest.TestCase):
                     "episodes": 12,
                     "status": "FINISHED",
                 },
+                {
+                    "sources": ["https://myanimelist.net/anime/309", "https://anilist.co/anime/491"],
+                    "title": "Overwrite Guard Show",
+                    "type": "TV",
+                    "episodes": 13,
+                    "status": "FINISHED",
+                },
+                {
+                    "sources": ["https://myanimelist.net/anime/600"],
+                    "title": "PlexAniBridge TV Fill",
+                    "type": "TV",
+                    "episodes": 12,
+                    "status": "FINISHED",
+                },
+                {
+                    "sources": ["https://myanimelist.net/anime/601"],
+                    "title": "PlexAniBridge Movie Guard",
+                    "type": "MOVIE",
+                    "episodes": 1,
+                    "status": "FINISHED",
+                },
+                {
+                    "sources": ["https://myanimelist.net/anime/700"],
+                    "title": "Legacy Saga (Kyuu Saga)",
+                    "type": "TV",
+                    "episodes": 12,
+                    "status": "FINISHED",
+                    "synonyms": ["000", "LS", "Legacy Saga Full English Title &amp; Extra"],
+                },
+                {
+                    "sources": ["https://myanimelist.net/anime/701"],
+                    "title": "Legacy Saga 2nd Season",
+                    "type": "TV",
+                    "episodes": 12,
+                    "status": "FINISHED",
+                },
             ]
         }
         with open(os.path.join(fdir, "manami.json"), "w", encoding="utf-8") as f:
@@ -126,9 +163,57 @@ class TestMappingsPipeline(unittest.TestCase):
                 "mal_id": 400,
                 "anidb_id": 402,
             },
+            {
+                "type": "TV",
+                "mal_id": 309,
+                "tvdb_id": 189011,
+                "themoviedb_id": {"tv": 35767},
+                "imdb_id": ["tt14642362"],
+                "season": {"tvdb": 1},
+            },
+            {
+                "type": "TV",
+                "anilist_id": 491,
+                "anidb_id": 2841,
+                "tvdb_id": 167921,
+                "themoviedb_id": {"tv": 56389},
+                "imdb_id": ["tt0367414"],
+                "season": {"tvdb": 0},
+            },
+            {
+                "type": "TV",
+                "mal_id": 700,
+                "tvdb_id": 700700,
+                "season": {"tvdb": 1},
+            },
+            {
+                "type": "TV",
+                "mal_id": 701,
+                "tvdb_id": 700700,
+                "season": {"tvdb": 2},
+            },
         ]
         with open(os.path.join(fdir, "fribb.json"), "w", encoding="utf-8") as f:
             json.dump(fribb, f)
+
+        pab = [
+            {
+                "mal_id": [600],
+                "tvdb_id": 600001,
+                "tmdb_show_id": 600002,
+                "imdb_id": ["tt6000001"],
+                "tvdb_mappings": {"s2": "e1-e12"},
+            },
+            {
+                "mal_id": [601],
+                "tvdb_id": 777001,
+                "tmdb_show_id": 888001,
+                "imdb_id": ["tt1234567"],
+                "tvdb_mappings": {"s0": "e1"},
+            },
+        ]
+        with open(os.path.join(fdir, "plexanibridge.json"), "w", encoding="utf-8") as f:
+            json.dump(pab, f)
 
         with open(os.path.join(fdir, "arm.json"), "w", encoding="utf-8") as f:
             json.dump([{"mal_id": 400, "anilist_id": 401, "annict_id": 1, "syobocal_tid": 2}], f)
@@ -163,7 +248,7 @@ class TestMappingsPipeline(unittest.TestCase):
   <anime anidbid="102" tvdbid="777001" defaulttvdbseason="1" tmdbtv="888001" imdbid="tt1234567">
     <name>Test Saga Season 1</name>
     <mapping-list>
-      <mapping anidbseason="1" tvdbseason="0">;13-1;</mapping>
+      <mapping anidbseason="1" tvdbseason="0">;13-1;14-0;</mapping>
     </mapping-list>
   </anime>
   <anime anidbid="99999" tvdbid="movie" defaulttvdbseason="0">
@@ -187,6 +272,8 @@ class TestMappingsPipeline(unittest.TestCase):
                 "episodes": 12,
                 "duration": 24,
                 "format": "TV",
+                "season": "SPRING",
+                "seasonYear": 2024,
                 "relations": {
                     "edges": [
                         {"relationType": "PREQUEL", "node": {"id": 101, "idMal": 100, "format": "TV"}}
@@ -254,9 +341,17 @@ class TestMappingsPipeline(unittest.TestCase):
                     '<tr><td class="Number">1</td><td class="Title">Canon</td><td class="Type"><span>Manga Canon</span></td></tr>'
                     '<tr><td class="Number">2</td><td class="Title">Beach</td><td class="Type"><span>Filler</span></td></tr>'
                     '<tr><td class="Number">3</td><td class="Title">Pool</td><td class="Type"><span>Mostly Filler</span></td></tr>'
-                    '<tr><td class="Number">4</td><td class="Title">Summary</td><td class="Type"><span>Recap</span></td></tr>'
+                    "<tr><td class=\"Number\">4</td><td class=\"Title\">Summary</td><td class=\"Type\"><span>Recap</span></td></tr>"
                     "</tbody></table>"
                 ),
+            },
+            {
+                "slug": "legacy-saga",
+                "title": "Legacy Saga",
+                "max_ep": 24,
+                "episodes": {
+                    "14": "Filler",
+                },
             },
         ]
         with open(os.path.join(fdir, "animefillerlist.json"), "w", encoding="utf-8") as f:
@@ -285,7 +380,7 @@ class TestMappingsPipeline(unittest.TestCase):
             )
             manifest = build_mappings.build_pipeline(ns)
             self.assertEqual(manifest["pruned_seed_shells"], 1)
-            self.assertEqual(manifest["total_rows"], 6)  # seed 21 + 100, 200, 300, 400, 500 (66863 pruned)
+            self.assertEqual(manifest["total_rows"], 11)  # seed 21 + 100, 200, 300, 309, 400, 500, 600, 601, 700, 701 (66863 pruned)
             self.assertGreaterEqual(manifest["rule_count"], 2)
             self.assertGreaterEqual(manifest["alias_count"], 1)
             self.assertGreaterEqual(manifest["franchise_link_count"], 2)
@@ -296,7 +391,7 @@ class TestMappingsPipeline(unittest.TestCase):
                 baseline_path=seed_p,
                 xz_path=f"{out_db}.xz",
                 manifest_path=manifest_p,
-                min_rows=6,
+                min_rows=11,
             )
             self.assertEqual(errs, [], f"Validation unexpectedly failed: {errs}")
 
@@ -310,30 +405,39 @@ class TestMappingsPipeline(unittest.TestCase):
                 self.assertEqual(r21["thetvdb_season"], "a")
                 self.assertIsNone(conn.execute("SELECT mal_id FROM anime WHERE mal_id=66863").fetchone())
 
-                # 2. Manami picture stripped to relative suffix + score rounded + dub populated
+                # 2. Manami picture, score, dub, & animeSeason year/season populated
                 r100 = conn.execute("SELECT * FROM anime WHERE mal_id=100").fetchone()
                 self.assertEqual(r100["mal_picture"], "12/34567.jpg")
                 self.assertEqual(r100["score"], 8.46)
                 self.assertEqual(r100["mal_dub_id"], 100)
                 self.assertEqual(r100["thetvdb_id"], 777001)
+                self.assertEqual(r100["year"], 2023)
+                self.assertEqual(r100["anime_season"], "FALL")
 
-                # 3. Direct AniList PREQUEL inheritance populated mal_id=200 from 100 + symmetric SEQUEL link
+                # 3. Direct AniList PREQUEL inheritance populated mal_id=200 + AniList year/season + symmetric SEQUEL link
                 r200 = conn.execute("SELECT * FROM anime WHERE mal_id=200").fetchone()
                 self.assertEqual(r200["thetvdb_id"], 777001)
                 self.assertEqual(r200["themoviedb_id"], 888001)
                 self.assertEqual(r200["imdb_id"], "tt1234567")
                 self.assertEqual(r200["thetvdb_season"], 2)
+                self.assertEqual(r200["year"], 2024)
+                self.assertEqual(r200["anime_season"], "SPRING")
 
                 links_200 = {(r["related_mal_id"], r["relation_type"]) for r in conn.execute("SELECT * FROM franchise_links WHERE mal_id=200")}
                 self.assertIn((100, "PREQUEL"), links_200)
                 links_100 = {(r["related_mal_id"], r["relation_type"]) for r in conn.execute("SELECT * FROM franchise_links WHERE mal_id=100")}
                 self.assertIn((200, "SEQUEL"), links_100)
 
-                # 4. Split-cour episode offset applied & UNIQUE anilist_id collision safely resolved
+                # 4. Split-cour episode offset applied, UNIQUE collision resolved, & Fribb fallback cannot overwrite explicit mal_id
                 r300 = conn.execute("SELECT * FROM anime WHERE mal_id=300").fetchone()
                 self.assertEqual(r300["global_media_episodes"], "13 - 25")
                 self.assertIsNone(r300["anilist_id"])  # 201 already owned by 200
                 self.assertIsNone(r300["simkl_id"])  # mismatched Simkl mal=99999 rejected
+                r309 = conn.execute("SELECT * FROM anime WHERE mal_id=309").fetchone()
+                self.assertEqual(r309["thetvdb_id"], 189011)
+                self.assertEqual(r309["themoviedb_id"], 35767)
+                self.assertEqual(r309["imdb_id"], "tt14642362")
+                self.assertEqual(r309["thetvdb_season"], 1)
 
                 # 5. ARM + Wikidata + AniDB titles + schedule_ids + anime_aliases backfill for mal_id=400
                 r400 = conn.execute("SELECT * FROM anime WHERE mal_id=400").fetchone()
@@ -358,22 +462,41 @@ class TestMappingsPipeline(unittest.TestCase):
                 self.assertEqual(r500["imdb_id"], "tt5000500")
                 self.assertEqual(r500["trakt_id"], 99500)
 
-                # 7. tvdb_rules table populated from both XML mapping-list & MALSync rules
+                # 6b. PlexAniBridge fills TV/ONA & seasons while guarding MOVIE against parent TV IMDb/TMDB
+                r600 = conn.execute("SELECT * FROM anime WHERE mal_id=600").fetchone()
+                self.assertEqual(r600["thetvdb_id"], 600001)
+                self.assertEqual(r600["themoviedb_id"], 600002)
+                self.assertEqual(r600["imdb_id"], "tt6000001")
+                self.assertEqual(r600["thetvdb_season"], 2)
+                r601 = conn.execute("SELECT * FROM anime WHERE mal_id=601").fetchone()
+                self.assertIsNone(r601["thetvdb_id"])
+                self.assertIsNone(r601["themoviedb_id"])
+                self.assertIsNone(r601["imdb_id"])
+
+                # 7. tvdb_rules skips range_start=0 sentinels and populates MALSync + XML rules
                 rules = conn.execute("SELECT * FROM tvdb_rules ORDER BY mal_id, rule_type").fetchall()
                 sources = {r["source"] for r in rules}
                 self.assertIn("anime_lists_xml", sources)
                 self.assertIn("malsync_rules", sources)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM tvdb_rules WHERE range_start < 1").fetchone()[0], 0)
 
-                # 8. filler_ranges maps multi-season SEQUEL chain & coalesces HTML intervals
+                # 8. filler_ranges maps multi-season SEQUEL & TVDB-sibling chains and unescapes/filters aliases
                 fr_100 = conn.execute("SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id=100 ORDER BY ep_start").fetchall()
                 self.assertEqual([tuple(r) for r in fr_100], [(5, 5, "Mixed Canon/Filler")])
                 fr_200 = conn.execute("SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id=200 ORDER BY ep_start").fetchall()
                 self.assertEqual([tuple(r) for r in fr_200], [(2, 3, "Filler"), (4, 4, "Recap")])
                 fr_500 = conn.execute("SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id=500 ORDER BY ep_start").fetchall()
                 self.assertEqual([tuple(r) for r in fr_500], [(2, 3, "Filler"), (4, 4, "Recap")])
-                self.assertEqual(manifest["schema_version"], "2.3")
-                self.assertEqual(manifest["filler_show_count"], 2)
-                self.assertEqual(manifest["filler_range_count"], 5)
+                fr_700 = conn.execute("SELECT ep_start, ep_end FROM filler_ranges WHERE mal_id=700").fetchall()
+                self.assertEqual(fr_700, [])
+                fr_701 = conn.execute("SELECT ep_start, ep_end, filler_type FROM filler_ranges WHERE mal_id=701").fetchall()
+                self.assertEqual([tuple(r) for r in fr_701], [(2, 2, "Filler")])
+                aliases_700 = {r["title"] for r in conn.execute("SELECT title FROM anime_aliases WHERE mal_id=700")}
+                self.assertNotIn("000", aliases_700)
+                self.assertIn("Legacy Saga Full English Title & Extra", aliases_700)
+                self.assertEqual(manifest["schema_version"], "2.4")
+                self.assertEqual(manifest["filler_show_count"], 3)
+                self.assertEqual(manifest["filler_range_count"], 6)
             finally:
                 conn.close()
 
@@ -387,7 +510,8 @@ class TestMappingsPipeline(unittest.TestCase):
                 "themoviedb_id INTEGER, imdb_id TEXT, trakt_id INTEGER, mal_title TEXT, "
                 "mal_picture TEXT, thetvdb_season INTEGER, thetvdb_part INTEGER, "
                 "duration INTEGER, score REAL, status TEXT, anime_media_type TEXT, "
-                "global_media_type TEXT, anime_media_episodes TEXT, global_media_episodes TEXT)"
+                "global_media_type TEXT, anime_media_episodes TEXT, global_media_episodes TEXT, "
+                "year INTEGER, anime_season TEXT)"
             )
             conn.execute("CREATE TABLE activities (sync_id INTEGER PRIMARY KEY, last_updated TEXT NOT NULL)")
             conn.execute("CREATE TABLE tvdb_rules (mal_id INTEGER, tvdb_id INTEGER, season INTEGER, rule_type TEXT, range_start INTEGER, range_end INTEGER, ep_start INTEGER, absolute_start INTEGER, source TEXT)")
@@ -435,6 +559,27 @@ class TestMappingsPipeline(unittest.TestCase):
             self.assertEqual(records[701]["trakt_id"], 7777)
             self.assertEqual(records[700]["trakt_id"], 7777)
             self.assertEqual(mock_get.call_count, 1)
+
+    def test_sanitize_trakt_collisions_respects_namespaces_and_clears_leaks(self):
+        records = {
+            # Same-IMDb leak across TV & MOVIE (like FLCL) -> clear leaked MOVIE trakt_id
+            227: build_mappings.empty_record(227) | {"anime_media_type": "TV", "global_media_type": "show", "imdb_id": "tt0279077", "trakt_id": 5857},
+            33010: build_mappings.empty_record(33010) | {"anime_media_type": "MOVIE", "global_media_type": "movie", "imdb_id": "tt0279077", "trakt_id": 5857},
+            # Independent TV & MOVIE with different IMDb/TMDb legitimately sharing Trakt namespace #8630
+            2814: build_mappings.empty_record(2814) | {"anime_media_type": "TV", "global_media_type": "show", "imdb_id": "tt0414728", "themoviedb_id": 8676, "trakt_id": 8630},
+            2264: build_mappings.empty_record(2264) | {"anime_media_type": "MOVIE", "global_media_type": "movie", "imdb_id": "tt0119406", "themoviedb_id": 8853, "trakt_id": 8630},
+            # Ungrounded orphan leaking trakt_id from a grounded franchise
+            1222: build_mappings.empty_record(1222) | {"anime_media_type": "TV", "global_media_type": "show", "imdb_id": "tt2147761", "trakt_id": 22476},
+            8337: build_mappings.empty_record(8337) | {"anime_media_type": "SPECIAL", "global_media_type": "movie", "trakt_id": 22476},
+        }
+        cleared = build_mappings.sanitize_trakt_collisions(records)
+        self.assertGreaterEqual(cleared, 2)
+        self.assertEqual(records[227]["trakt_id"], 5857)
+        self.assertIsNone(records[33010]["trakt_id"])
+        self.assertEqual(records[2814]["trakt_id"], 8630)
+        self.assertEqual(records[2264]["trakt_id"], 8630)
+        self.assertEqual(records[1222]["trakt_id"], 22476)
+        self.assertIsNone(records[8337]["trakt_id"])
 
 
 if __name__ == "__main__":

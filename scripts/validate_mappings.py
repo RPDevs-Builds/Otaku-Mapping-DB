@@ -17,6 +17,7 @@ REQUIRED_COLUMNS = (
     "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_title", "mal_picture",
     "thetvdb_season", "thetvdb_part", "duration", "score", "status",
     "anime_media_type", "global_media_type", "anime_media_episodes", "global_media_episodes",
+    "year", "anime_season",
 )
 INDEXED_LOOKUP_COLUMNS = (
     ("mal_id", 1),
@@ -30,6 +31,7 @@ INDEXED_LOOKUP_COLUMNS = (
     ("trakt_id", 1),
     ("mal_dub_id", 1),
     ("mal_title", "Cowboy Bebop"),
+    ("year", 2024),
 )
 INTEGER_ID_COLS = frozenset({
     "mal_id", "mal_dub_id", "anilist_id", "kitsu_id", "anidb_id",
@@ -114,6 +116,18 @@ def validate_database(
         ).fetchone()[0]
         if bad_season:
             errors.append(f"Column thetvdb_season contains {bad_season} invalid non-integer/non-'a' values")
+
+        bad_year = conn.execute(
+            "SELECT COUNT(*) FROM anime WHERE year IS NOT NULL AND (typeof(year) != 'integer' OR year < 1900 OR year > 2035)"
+        ).fetchone()[0]
+        if bad_year:
+            errors.append(f"Column year contains {bad_year} out-of-range/non-integer values")
+
+        bad_anime_season = conn.execute(
+            "SELECT COUNT(*) FROM anime WHERE anime_season IS NOT NULL AND anime_season NOT IN ('WINTER', 'SPRING', 'SUMMER', 'FALL')"
+        ).fetchone()[0]
+        if bad_anime_season:
+            errors.append(f"Column anime_season contains {bad_anime_season} invalid seasonal values")
 
         empty_shells = conn.execute(
             "SELECT COUNT(*) FROM anime WHERE mal_title IS NULL AND status IS NULL "
@@ -202,6 +216,30 @@ def validate_database(
             ).fetchone()[0]
             if bad_types:
                 errors.append(f"filler_ranges contains {bad_types} invalid filler_type values")
+            bad_ep_overrun = 0
+            for ep_end, ep_rng in conn.execute(
+                "SELECT f.ep_end, a.anime_media_episodes FROM filler_ranges f "
+                "JOIN anime a ON a.mal_id = f.mal_id "
+                "WHERE a.status = 'FINISHED' AND a.anime_media_type IN ('TV', 'ONA') AND a.anime_media_episodes IS NOT NULL"
+            ).fetchall():
+                m_end = re.match(r"^\s*\d+\s*-\s*(\d+)\s*$", str(ep_rng or ""))
+                if m_end and ep_end > int(m_end.group(1)) + 2:
+                    bad_ep_overrun += 1
+            if bad_ep_overrun:
+                errors.append(f"filler_ranges contains {bad_ep_overrun} finished-show episode overrun rows")
+
+        if "tvdb_rules" in tables:
+            bad_rules = conn.execute(
+                "SELECT COUNT(*) FROM tvdb_rules WHERE season < 0 OR range_start < 1 OR ep_start < 1"
+            ).fetchone()[0]
+            if bad_rules:
+                errors.append(f"tvdb_rules contains {bad_rules} invalid rule bounds (<1)")
+            mismatched_tvdb = conn.execute(
+                "SELECT COUNT(*) FROM tvdb_rules r JOIN anime a ON a.mal_id = r.mal_id "
+                "WHERE r.tvdb_id IS NOT NULL AND a.thetvdb_id IS NOT NULL AND r.tvdb_id != a.thetvdb_id"
+            ).fetchone()[0]
+            if mismatched_tvdb:
+                errors.append(f"tvdb_rules contains {mismatched_tvdb} rows disagreeing with anime.thetvdb_id")
 
         # Baseline monotone coverage comparison (ignoring empty phantom seed shells > 64000)
         if baseline_path and os.path.isfile(baseline_path):

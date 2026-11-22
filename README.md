@@ -13,21 +13,21 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
 3. **kawaiioverflow/arm** (`kawaiioverflow/arm`): Additional `mal_id <-> anilist_id` cross-reference backfill prior to downstream merges.
 4. **Fribb Anime Lists** (`Fribb/anime-lists`): Cross-references `thetvdb_id`, `themoviedb_id` (`tv` / `movie`), `imdb_id`, seasons, and episode offsets.
 5. **Anime-Lists XML** (`Anime-Lists/anime-lists`): `anidbid`-keyed TVDB/TMDB season/offset defaults and `<mapping-list>` episode split rules into `tvdb_rules`.
-6. **Kometa Anime-IDs** (`Kometa-Team/Anime-IDs`), **Wikidata SPARQL** (`P4086` <-> IMDb/TVDB/TMDb), **AniDB Official Titles** (`anime-titles.xml.gz`), & **MAL-Dubs** (`MAL-Dubs/MAL-Dubs`): Backfills missing cross-platform IDs, missing titles, and `mal_dub_id`.
+6. **Kometa Anime-IDs** (`Kometa-Team/Anime-IDs`), **PlexAniBridge-Mappings** (`eliasbenb/PlexAniBridge-Mappings` v2), **Wikidata SPARQL** (`P4086` <-> IMDb/TVDB/TMDb), **AniDB Official Titles** (`anime-titles.xml.gz`), & **MAL-Dubs** (`MAL-Dubs/MAL-Dubs`): Backfills missing cross-platform IDs, missing TVDB seasons, missing titles, and `mal_dub_id`.
 7. **Incremental Cached Live API Hydration** (`actions/cache` delta-only):
-   - **AniList GraphQL** (`graphql.anilist.co` batches of 50): Fills airing/recent/untitled metadata (`format`, `status`, `title`, `episodes`) and `PREQUEL` relation edges.
+   - **AniList GraphQL** (`graphql.anilist.co` batches of 50): Fills airing/recent/untitled metadata (`format`, `status`, `title`, `episodes`, `season`, `seasonYear`) and `PREQUEL` relation edges.
    - **AniZip** (`api.ani.zip/mappings?mal_id=...`): Direct `thetvdb_id`, `themoviedb_id`, `imdb_id`, episode count, and `seasonNumber` for newly airing shows.
-   - **MALSync Rules** (`api.malsync.moe/tvdb/rules/cache-key/...`): Populates split-cour and `absoluteStart` episode rules into `tvdb_rules`.
-   - **Simkl Extended API** (`api.simkl.com`) & **Trakt Search API** (`TRAKT_CLIENT_ID`): Fills remaining missing `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, and `trakt_id` (`anime-ids` + IMDb/TMDb resolution).
-   - **AnimeFillerList** (`animefillerlist.com/shows`): Pre-computes non-canon episode intervals (`Filler`, `Mixed Canon/Filler`, `Recap`) mapped cleanly across single-season and `SEQUEL` franchise chains into `filler_ranges`.
+   - **MALSync Rules** (`api.malsync.moe/tvdb/rules/cache-key/...`): Populates split-cour and `absoluteStart` episode rules into `tvdb_rules` across MAL and AniList franchise entries.
+   - **Simkl Extended API** (`api.simkl.com`) & **Trakt Search API** (`TRAKT_CLIENT_ID`): Fills remaining missing `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, and media-kind-scoped `trakt_id`.
+   - **AnimeFillerList** (`animefillerlist.com/shows`): Pre-computes non-canon episode intervals (`Filler`, `Mixed Canon/Filler`, `Recap`) mapped across `TV`/`ONA` `SEQUEL` and shared-TVDB chains into `filler_ranges`.
    - **Transitive Prequel Inheritance**: Propagates unambiguous franchise `thetvdb_id` / `themoviedb_id` / `imdb_id` down direct TV sequel chains.
 
 ---
 
 ## Schema & Performance Enhancements
 
-- **100% Backward Compatible `anime` Table**: Preserves all 21 columns (`mal_id`, `mal_dub_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_title`, `mal_picture`, `thetvdb_season`, `thetvdb_part`, `duration`, `score`, `status`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`).
-- **Zero Full-Table Scans**: Adds B-tree indexes on `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, and `mal_title`, plus `ANALYZE` statistics and `VACUUM` optimization for `file:...db?mode=ro` readers.
+- **Backward-Compatible Extended `anime` Table (`v2.4`)**: Preserves all 21 core columns (`mal_id`, `mal_dub_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_title`, `mal_picture`, `thetvdb_season`, `thetvdb_part`, `duration`, `score`, `status`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`) and adds indexed `year` (`INTEGER`) and `anime_season` (`WINTER`/`SPRING`/`SUMMER`/`FALL`).
+- **Zero Full-Table Scans**: Adds B-tree indexes on `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, `mal_title`, and `year`, plus `ANALYZE` statistics and `VACUUM` optimization for `file:...db?mode=ro` readers.
 - **Additive Tables**:
   - `tvdb_rules`: Split-cour, special, and `absolute_start` episode mapping rules from `Anime-Lists` XML and `MALSync`.
   - `anime_aliases`: Compact `WITHOUT ROWID` indexed multi-language alternate titles (`Manami` synonyms, `AniDB` `x-jat`/`en`/`short`, `AniList` English/Romaji/synonyms) for instant offline search and scraper matching (`ix_aliases_title`).
