@@ -1104,11 +1104,13 @@ def hydrate_trakt_ids(records, cache: ApiCache, offline_dir=None, max_items=100,
                     tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
             if status in (200, 404, 400):
                 cache.set("trakt", mid, tid)
-            time.sleep(0.25)
+            time.sleep(0.28)
         except Exception:
             cache.set("trakt", mid, 0)
         if parse_pos_int(tid) and not rec["trakt_id"]:
             rec["trakt_id"] = int(tid)
+    resolved_total = sum(1 for r in records.values() if r.get("trakt_id"))
+    print(f"Trakt hydration: total={resolved_total:,} (queue={len(to_fetch):,}, cap={max_items})")
 
 
 def _fetch_simkl_record(mal_id, existing_simkl_id=None):
@@ -1974,20 +1976,21 @@ def build_pipeline(args):
     prequel_edges = {}
     wall_deadline = 0.0
     if args.api_budget_seconds > 0 or args.offline_fixtures:
-        wall_deadline = time.time() + args.api_budget_seconds if not args.offline_fixtures else 0.0
-        # Reserve up to ~30% of live wall budget (capped at 95s) when AFL cache needs initial warming
-        afl_reserve = min(95.0, args.api_budget_seconds * 0.30) if (not args.offline_fixtures and args.api_budget_seconds > 30) else 0.0
-        api_deadline = (wall_deadline - afl_reserve) if wall_deadline else 0.0
+        now_s = time.time()
+        wall_deadline = (now_s + args.api_budget_seconds) if not args.offline_fixtures else 0.0
+        anilist_deadline = (now_s + args.api_budget_seconds * 0.25) if wall_deadline else 0.0
+        anizip_deadline = (now_s + args.api_budget_seconds * 0.55) if wall_deadline else 0.0
+        trakt_deadline = (now_s + args.api_budget_seconds * 0.80) if wall_deadline else 0.0
         prequel_edges = hydrate_anilist_relations(
             records, cache, ep_counts, args.offline_fixtures,
-            deadline=api_deadline, franchise_links=franchise_links, aliases_map=aliases_map,
+            deadline=anilist_deadline, franchise_links=franchise_links, aliases_map=aliases_map,
         )
         extra_rules = hydrate_anizip_and_malsync(
-            records, cache, ep_counts, args.offline_fixtures, max_items=args.max_api_items, deadline=api_deadline
+            records, cache, ep_counts, args.offline_fixtures, max_items=args.max_api_items, deadline=anizip_deadline
         )
         hydrate_trakt_ids(
             records, cache, args.offline_fixtures,
-            max_items=min(800, args.max_api_items), deadline=api_deadline,
+            max_items=min(1000, args.max_api_items), deadline=trakt_deadline,
         )
 
     apply_prequel_inheritance(records, prequel_edges, manami_related)
