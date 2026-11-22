@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-SCHEMA_VERSION = "2.5"
+SCHEMA_VERSION = "2.6"
 
 SOURCE_URLS = {
     "fribb": "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json",
@@ -95,21 +95,26 @@ REQUIRED_COLUMNS = (
     "global_media_episodes",
     "year",
     "anime_season",
+    "episodes",
+    "title_english",
+    "genres",
+    "studios",
+    "start_date",
+    "trakt_slug",
 )
 
 INDEXED_STATEMENTS = (
-    'CREATE UNIQUE INDEX IF NOT EXISTS ix_anidb ON "anime" (anidb_id ASC)',
-    'CREATE UNIQUE INDEX IF NOT EXISTS ix_anilist ON "anime" (anilist_id ASC)',
-    'CREATE UNIQUE INDEX IF NOT EXISTS ix_kitsu ON "anime" (kitsu_id ASC)',
-    'CREATE UNIQUE INDEX IF NOT EXISTS ix_mal ON "anime" (mal_id ASC)',
-    'CREATE UNIQUE INDEX IF NOT EXISTS ix_simkl ON "anime" (simkl_id ASC)',
-    'CREATE INDEX IF NOT EXISTS ix_tvdb ON "anime" (thetvdb_id) WHERE thetvdb_id IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS ix_anidb ON "anime" (anidb_id, mal_id) WHERE anidb_id IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS ix_anilist ON "anime" (anilist_id, mal_id) WHERE anilist_id IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS ix_kitsu ON "anime" (kitsu_id, mal_id) WHERE kitsu_id IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS ix_simkl ON "anime" (simkl_id, mal_id) WHERE simkl_id IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS ix_tvdb_season_part ON "anime" (thetvdb_id, thetvdb_season, thetvdb_part) WHERE thetvdb_id IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_tmdb ON "anime" (themoviedb_id) WHERE themoviedb_id IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_imdb ON "anime" (imdb_id) WHERE imdb_id IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_trakt ON "anime" (trakt_id) WHERE trakt_id IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_mal_dub ON "anime" (mal_dub_id) WHERE mal_dub_id IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_mal_title ON "anime" (mal_title) WHERE mal_title IS NOT NULL',
-    'CREATE INDEX IF NOT EXISTS ix_year ON "anime" (year) WHERE year IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS ix_year_season_type_score ON "anime" (year, anime_season, anime_media_type, score DESC, mal_id DESC) WHERE year IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_tvdb_rules_mal ON "tvdb_rules" (mal_id)',
     'CREATE INDEX IF NOT EXISTS ix_tvdb_rules_tvdb ON "tvdb_rules" (tvdb_id) WHERE tvdb_id IS NOT NULL',
     'CREATE INDEX IF NOT EXISTS ix_aliases_title ON "anime_aliases" (title)',
@@ -271,6 +276,132 @@ def parse_range_tuple(val):
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
+
+
+_CANONICAL_GENRES = {
+    "action": "Action",
+    "adventure": "Adventure",
+    "avant garde": "Avant Garde",
+    "award winning": "Award Winning",
+    "boys love": "Boys Love",
+    "comedy": "Comedy",
+    "drama": "Drama",
+    "ecchi": "Ecchi",
+    "fantasy": "Fantasy",
+    "girls love": "Girls Love",
+    "gourmet": "Gourmet",
+    "horror": "Horror",
+    "mahou shoujo": "Mahou Shoujo",
+    "mecha": "Mecha",
+    "music": "Music",
+    "mystery": "Mystery",
+    "psychological": "Psychological",
+    "romance": "Romance",
+    "sci-fi": "Sci-Fi",
+    "slice of life": "Slice of Life",
+    "sports": "Sports",
+    "supernatural": "Supernatural",
+    "suspense": "Suspense",
+    "thriller": "Thriller",
+}
+
+_STUDIO_CASE_MAP = {
+    "a-1 pictures": "A-1 Pictures",
+    "bones": "Bones",
+    "cloverworks": "CloverWorks",
+    "david production": "david production",
+    "doga kobo": "Doga Kobo",
+    "j.c.staff": "J.C.Staff",
+    "kyoto animation": "Kyoto Animation",
+    "lerche": "Lerche",
+    "lidenfilms": "LIDENFILMS",
+    "madhouse": "Madhouse",
+    "mappa": "MAPPA",
+    "olm": "OLM",
+    "orange": "Orange",
+    "p.a. works": "P.A. Works",
+    "pierrot": "Pierrot",
+    "production i.g": "Production I.G",
+    "shaft": "Shaft",
+    "silver link.": "SILVER LINK.",
+    "sunrise": "Sunrise",
+    "tms entertainment": "TMS Entertainment",
+    "toei animation": "Toei Animation",
+    "trigger": "Trigger",
+    "troyca": "TROYCA",
+    "ufotable": "ufotable",
+    "white fox": "WHITE FOX",
+    "wit studio": "WIT Studio",
+}
+
+_RE_TRAKT_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,119}$")
+
+
+def _format_canonical_genres(raw_list, whitelist_only=False):
+    if not raw_list:
+        return None
+    out = []
+    seen = set()
+    for item in raw_list:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        low = text.lower()
+        if low in _CANONICAL_GENRES:
+            val = _CANONICAL_GENRES[low]
+        elif whitelist_only:
+            continue
+        else:
+            val = text
+        if val.lower() not in seen:
+            seen.add(val.lower())
+            out.append(val)
+    return ", ".join(out[:8]) if out else None
+
+
+def _format_studios(raw_list, preserve_case=False):
+    if not raw_list:
+        return None
+    out = []
+    seen = set()
+    for item in raw_list:
+        text = _RE_WS.sub(" ", str(item or "").strip())
+        if not text:
+            continue
+        low = text.lower()
+        if low in _STUDIO_CASE_MAP:
+            val = _STUDIO_CASE_MAP[low]
+        elif preserve_case or any(ch.isupper() for ch in text):
+            val = text
+        else:
+            val = " ".join(w.capitalize() if len(w) > 3 else w.upper() if "." not in w else w.upper() for w in text.split(" "))
+        if val.lower() not in seen:
+            seen.add(val.lower())
+            out.append(val)
+    return ", ".join(out[:3]) if out else None
+
+
+def _format_start_date(date_obj):
+    if isinstance(date_obj, str):
+        m = re.match(r"^\s*(\d{4}-\d{2}-\d{2}|\d{4}-\d{2})", date_obj)
+        return m.group(1) if m else None
+    if not isinstance(date_obj, dict):
+        return None
+    y = parse_year(date_obj.get("year"))
+    m = parse_pos_int(date_obj.get("month"))
+    d = parse_pos_int(date_obj.get("day"))
+    if not y or not m or m > 12:
+        return None
+    if d and d <= 31:
+        return f"{y:04d}-{m:02d}-{d:02d}"
+    return f"{y:04d}-{m:02d}"
+
+
+def clean_trakt_slug(val):
+    if not val:
+        return None
+    s = str(val).strip().lower()
+    return s if _RE_TRAKT_SLUG.match(s) else None
 
 
 def empty_record(mal_id):
@@ -495,7 +626,9 @@ def load_seed_database(seed_path):
                     val = parse_year(val)
                 elif col == "anime_season":
                     val = clean_anime_season(val)
-                elif col in ("mal_dub_id", "anilist_id", "kitsu_id", "anidb_id", "simkl_id", "thetvdb_id", "themoviedb_id", "trakt_id", "thetvdb_part", "duration"):
+                elif col == "trakt_slug":
+                    val = clean_trakt_slug(val)
+                elif col in ("mal_dub_id", "anilist_id", "kitsu_id", "anidb_id", "simkl_id", "thetvdb_id", "themoviedb_id", "trakt_id", "thetvdb_part", "duration", "episodes"):
                     val = parse_pos_int(val)
                 elif isinstance(val, str) and not val.strip():
                     val = None
@@ -591,9 +724,19 @@ def merge_manami(records, manami_bytes, aliases_map=None):
         eps = parse_pos_int(entry.get("episodes"))
         if eps:
             ep_counts[mal_id] = eps
+            rec["episodes"] = eps
             rec["anime_media_episodes"] = format_episode_range(1, eps)
             if not rec["global_media_episodes"]:
                 rec["global_media_episodes"] = format_episode_range(1, eps)
+
+        if not rec["genres"] and entry.get("tags"):
+            g_str = _format_canonical_genres(entry.get("tags"), whitelist_only=True)
+            if g_str:
+                rec["genres"] = g_str
+        if not rec["studios"] and entry.get("studios"):
+            st_str = _format_studios(entry.get("studios"), preserve_case=False)
+            if st_str:
+                rec["studios"] = st_str
 
         for rel_url in entry.get("relatedAnime") or ():
             m_rel = _RE_MAL_URL.search(str(rel_url))
@@ -606,9 +749,16 @@ def merge_manami(records, manami_bytes, aliases_map=None):
 
 
 def _parse_fribb_tmdb(raw_tmdb, media_type):
+    mt_upper = str(media_type or "").upper()
     if isinstance(raw_tmdb, dict):
-        if str(media_type).upper() == "MOVIE" and raw_tmdb.get("movie"):
-            return parse_pos_int(raw_tmdb.get("movie")), "movie"
+        if mt_upper == "MOVIE":
+            if raw_tmdb.get("movie"):
+                return parse_pos_int(raw_tmdb.get("movie")), "movie"
+            return None, None
+        if mt_upper in ("TV", "ONA"):
+            if raw_tmdb.get("tv"):
+                return parse_pos_int(raw_tmdb.get("tv")), "show"
+            return None, None
         if raw_tmdb.get("tv"):
             return parse_pos_int(raw_tmdb.get("tv")), "show"
         if raw_tmdb.get("movie"):
@@ -662,7 +812,7 @@ def merge_fribb(records, fribb_bytes, ep_counts):
                 tvdb_season = clean_season(season_raw.get("tmdb"))
         else:
             tvdb_season = clean_season(season_raw)
-        if tvdb_season is not None and rec["thetvdb_season"] != "a" and (allow_overwrite or rec["thetvdb_season"] is None):
+        if tvdb_season is not None and rec["anime_media_type"] != "MOVIE" and rec["thetvdb_season"] != "a" and (allow_overwrite or rec["thetvdb_season"] is None):
             rec["thetvdb_season"] = tvdb_season
 
         ep_off = parse_nonneg_int(entry.get("episode_offset"))
@@ -900,8 +1050,11 @@ def _as_int_list(val):
     return out
 
 
-def merge_plexanibridge(records, pab_bytes):
-    """Fill missing TVDB/TMDB/IMDb/season metadata from PlexAniBridge-Mappings (fill-missing only, type-safe)."""
+_RE_PAB_EP_SPAN = re.compile(r"e(\d+)(?:\s*-\s*e?(\d+))?", re.I)
+
+
+def merge_plexanibridge(records, pab_bytes, rules=None):
+    """Fill missing TVDB/TMDB/IMDb/season metadata & tvdb_rules from PlexAniBridge-Mappings (fill-missing only, type-safe)."""
     if not pab_bytes:
         return 0
     payload = json.loads(pab_bytes.decode("utf-8"))
@@ -938,10 +1091,11 @@ def merge_plexanibridge(records, pab_bytes):
         tmap = entry.get("tvdb_mappings")
         cand_season = None
         is_special_only_map = False
+        parsed_seasons = []
         if isinstance(tmap, dict) and tmap:
             pos_seasons = []
             has_s0 = False
-            for k in tmap.keys():
+            for k, raw_span in tmap.items():
                 m_s = _RE_PAB_SEASON.match(str(k).strip())
                 if m_s:
                     sn = int(m_s.group(1))
@@ -949,7 +1103,13 @@ def merge_plexanibridge(records, pab_bytes):
                         pos_seasons.append(sn)
                     elif sn == 0:
                         has_s0 = True
-            if len(pos_seasons) == 1 and not has_s0:
+                    m_ep = _RE_PAB_EP_SPAN.search(str(raw_span or ""))
+                    if m_ep and sn >= 0:
+                        rs = int(m_ep.group(1))
+                        re_ep = int(m_ep.group(2)) if m_ep.group(2) else rs
+                        if rs >= 1 and re_ep >= rs:
+                            parsed_seasons.append((sn, rs, re_ep))
+            if len(pos_seasons) == 1:
                 cand_season = pos_seasons[0]
             if has_s0 and not pos_seasons:
                 is_special_only_map = True
@@ -999,6 +1159,26 @@ def merge_plexanibridge(records, pab_bytes):
                 rec["thetvdb_season"] = cand_season
                 filled += 1
 
+            if rules is not None and len(mids) == 1 and mtype in ("TV", "ONA") and parsed_seasons:
+                eff_tvdb = p_tvdb or rec.get("thetvdb_id")
+                if eff_tvdb:
+                    pos_spans = [(sn, rs, re_ep) for sn, rs, re_ep in sorted(parsed_seasons) if sn >= 1]
+                    if len(pos_spans) >= 2 or (len(pos_spans) == 1 and pos_spans[0][1] > 1):
+                        ep_cursor = 1
+                        for sn, rs, re_ep in pos_spans:
+                            rules.append({
+                                "mal_id": mid,
+                                "tvdb_id": eff_tvdb,
+                                "season": sn,
+                                "rule_type": "plexanibridge",
+                                "range_start": rs,
+                                "range_end": re_ep,
+                                "ep_start": ep_cursor,
+                                "absolute_start": None,
+                                "source": "plexanibridge",
+                            })
+                            ep_cursor += (re_ep - rs + 1)
+
     return filled
 
 
@@ -1027,6 +1207,8 @@ def merge_anidb_titles(records, raw_bytes, aliases_map=None):
             continue
         best_rank = 99
         best_title = None
+        best_en_rank = 99
+        best_en_title = None
         alias_candidates = []
         for t_el in anime_el.findall("title"):
             text = (t_el.text or "").strip()
@@ -1051,6 +1233,11 @@ def merge_anidb_titles(records, raw_bytes, aliases_map=None):
             if rank < best_rank:
                 best_rank = rank
                 best_title = text
+            if lang == "en" and ttype in ("official", "main", "syn"):
+                erank = 0 if ttype == "official" else (1 if ttype == "main" else 2)
+                if erank < best_en_rank:
+                    best_en_rank = erank
+                    best_en_title = text
             if aliases_map is not None and lang in allowed_langs and ttype in ("main", "official", "syn", "short"):
                 alias_candidates.append((rank, text, lang, ttype))
 
@@ -1060,6 +1247,10 @@ def merge_anidb_titles(records, raw_bytes, aliases_map=None):
                 if not records[mid]["mal_title"]:
                     records[mid]["mal_title"] = best_title
                     filled += 1
+        if best_en_title:
+            for mid in mids:
+                if not records[mid]["title_english"]:
+                    records[mid]["title_english"] = best_en_title
         if aliases_map is not None and alias_candidates:
             alias_candidates.sort(key=lambda x: x[0])
             for _, text, lang, ttype in alias_candidates[:6]:
@@ -1091,34 +1282,50 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
             )
         return prequel_edges
 
-    # Prioritize missing-title/status rows, recent IDs (>= 55000), and TV/ONA/OVA/MOVIE missing IDs or years
-    candidates = [
-        mid for mid, r in records.items()
-        if (
+    # Tier 0: missing title/status, recent IDs (>= 55000) without year, ongoing/upcoming, or 50000+ missing IDs
+    # Tier 1: < 50000 TV/ONA/MOVIE missing genres/start_date/title_english or uncached relations (sorted by score DESC)
+    candidates_tier0 = []
+    candidates_tier1 = []
+    for mid, r in records.items():
+        mtype = r.get("anime_media_type")
+        is_tier0 = (
             not r.get("mal_title")
             or not r.get("status")
             or (mid >= 55000 and not r.get("year"))
             or (
-                r.get("anime_media_type") in ("TV", "ONA", "OVA", "MOVIE", None)
+                mtype in ("TV", "ONA", "OVA", "MOVIE", None)
                 and (
                     r.get("status") in ("ONGOING", "UPCOMING")
                     or (mid >= 50000 and (not r.get("thetvdb_id") or not r.get("themoviedb_id")))
                 )
             )
         )
-    ]
-    candidates.sort(
+        if is_tier0:
+            candidates_tier0.append(mid)
+        elif mtype in ("TV", "ONA", "MOVIE") and (not r.get("start_date") or not r.get("genres") or not r.get("title_english")):
+            candidates_tier1.append(mid)
+
+    candidates_tier0.sort(
         key=lambda m: (
             0 if not records[m].get("mal_title") else (1 if m >= 55000 else 2),
             -m,
         )
     )
+    candidates_tier1.sort(
+        key=lambda m: (
+            0 if records[m].get("anime_media_type") == "TV" else (1 if records[m].get("anime_media_type") == "MOVIE" else 2),
+            -(float(records[m].get("score") or 0.0)),
+            -m,
+        )
+    )
+    candidates = candidates_tier0 + candidates_tier1
 
     query = """query ($ids: [Int]) {
   Page(perPage: 50) {
     media(idMal_in: $ids, type: ANIME) {
-      id idMal status episodes duration format season seasonYear
-      startDate { year }
+      id idMal status episodes duration format season seasonYear genres
+      startDate { year month day }
+      studios(isMain: true) { nodes { name } }
       title { romaji english userPreferred }
       synonyms
       relations { edges { relationType node { id idMal format } } }
@@ -1182,8 +1389,9 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
     id_query = """query ($ids: [Int]) {
   Page(perPage: 50) {
     media(id_in: $ids, type: ANIME) {
-      id idMal status episodes duration format season seasonYear
-      startDate { year }
+      id idMal status episodes duration format season seasonYear genres
+      startDate { year month day }
+      studios(isMain: true) { nodes { name } }
       title { romaji english userPreferred }
       synonyms
       relations { edges { relationType node { id idMal format } } }
@@ -1242,11 +1450,26 @@ def _apply_anilist_media(records, media_list, ep_counts, prequel_edges, franchis
             t = (title_obj.get("userPreferred") or title_obj.get("romaji") or title_obj.get("english") or "").strip()
             if t:
                 rec["mal_title"] = t
+        en_title = (title_obj.get("english") or "").strip()
+        if en_title and not rec["title_english"]:
+            rec["title_english"] = en_title
         if aliases_map is not None:
             for tk, lang, ttype in (("romaji", "x-jat", "romaji"), ("english", "en", "english"), ("userPreferred", "und", "main")):
                 _add_alias(aliases_map, mid, title_obj.get(tk), "anilist", lang=lang, title_type=ttype)
             for syn in (m.get("synonyms") or ())[:4]:
                 _add_alias(aliases_map, mid, syn, "anilist", lang="und", title_type="syn")
+        if m.get("genres"):
+            al_genres = _format_canonical_genres(m.get("genres"), whitelist_only=False)
+            if al_genres:
+                rec["genres"] = al_genres
+        studio_nodes = ((m.get("studios") or {}).get("nodes") or ())
+        if studio_nodes:
+            al_studios = _format_studios([n.get("name") for n in studio_nodes if isinstance(n, dict)], preserve_case=True)
+            if al_studios:
+                rec["studios"] = al_studios
+        sd = _format_start_date(m.get("startDate"))
+        if sd and (not rec["start_date"] or len(sd) > len(str(rec["start_date"]))):
+            rec["start_date"] = sd
         if not rec["status"] and m.get("status") in status_map:
             rec["status"] = status_map[m["status"]]
         if not rec["year"]:
@@ -1272,6 +1495,7 @@ def _apply_anilist_media(records, media_list, ep_counts, prequel_edges, franchis
         eps = parse_pos_int(m.get("episodes"))
         if eps and mid not in ep_counts:
             ep_counts[mid] = eps
+            rec["episodes"] = eps
             rec["anime_media_episodes"] = format_episode_range(1, eps)
             if not rec["global_media_episodes"]:
                 rec["global_media_episodes"] = format_episode_range(1, eps)
@@ -1345,7 +1569,20 @@ def _match_trakt_title_year_candidate(arr, rec, kind, title_norms):
             continue
         if rec.get("imdb_id") and c_imdb and rec["imdb_id"] != c_imdb:
             continue
-        hit = {"trakt_id": tid, "thetvdb_id": c_tvdb, "themoviedb_id": c_tmdb, "imdb_id": c_imdb}
+        id_confirmed = bool(
+            (rec.get("thetvdb_id") and c_tvdb == rec.get("thetvdb_id"))
+            or (rec.get("themoviedb_id") and c_tmdb == rec.get("themoviedb_id"))
+            or (rec.get("imdb_id") and c_imdb == rec.get("imdb_id"))
+        )
+        hit = {
+            "trakt_id": tid,
+            "trakt_slug": clean_trakt_slug(ids.get("slug")),
+            "thetvdb_id": c_tvdb,
+            "themoviedb_id": c_tmdb,
+            "imdb_id": c_imdb,
+            "_exact_year": (tyear == rec_year),
+            "_strong": (tyear == rec_year or id_confirmed) and len(t_norm) >= 4,
+        }
         if tyear == rec_year:
             exact_matches.append(hit)
         else:
@@ -1355,31 +1592,44 @@ def _match_trakt_title_year_candidate(arr, rec, kind, title_norms):
     return pool[0] if len(distinct_tids) == 1 else None
 
 
-def _apply_trakt_payload(rec, payload):
-    """Apply resolved Trakt ID and backfill missing IMDb/TMDb/TVDB IDs safely."""
+def _apply_trakt_payload(rec, payload, allow_id_backfill=True):
+    """Apply resolved Trakt ID/slug and cautiously backfill missing IMDb/TMDb/TVDB IDs."""
     if not rec or not isinstance(payload, dict):
         return False
     tid = parse_pos_int(payload.get("trakt_id"))
     if not tid or rec.get("trakt_id"):
         return False
     rec["trakt_id"] = tid
-    if not rec.get("thetvdb_id") and parse_pos_int(payload.get("thetvdb_id")):
-        rec["thetvdb_id"] = parse_pos_int(payload["thetvdb_id"])
-    if not rec.get("themoviedb_id") and parse_pos_int(payload.get("themoviedb_id")):
-        rec["themoviedb_id"] = parse_pos_int(payload["themoviedb_id"])
-    c_imdb = clean_imdb_id(payload.get("imdb_id"))
-    if not rec.get("imdb_id") and c_imdb:
-        rec["imdb_id"] = c_imdb
+    slug = clean_trakt_slug(payload.get("trakt_slug"))
+    if slug and not rec.get("trakt_slug"):
+        rec["trakt_slug"] = slug
+    strong_writeback = allow_id_backfill and payload.get("_strong", True)
+    if strong_writeback:
+        kind = _media_kind(rec)
+        if kind != "movie" and not rec.get("thetvdb_id") and parse_pos_int(payload.get("thetvdb_id")):
+            rec["thetvdb_id"] = parse_pos_int(payload["thetvdb_id"])
+        if not rec.get("themoviedb_id") and parse_pos_int(payload.get("themoviedb_id")):
+            rec["themoviedb_id"] = parse_pos_int(payload["themoviedb_id"])
+        c_imdb = clean_imdb_id(payload.get("imdb_id"))
+        if not rec.get("imdb_id") and c_imdb:
+            rec["imdb_id"] = c_imdb
     return True
 
 
-def sanitize_trakt_collisions(records):
-    """Clear same-franchise cross-type leaks, orphan seed leaks, and same-kind trakt_id collisions.
+def _trakt_cluster_rank(grp, kind_filter):
+    primary_hits = sum(
+        1 for _m, r in grp
+        if (r.get("anime_media_type") == "MOVIE" if kind_filter == "movie" else r.get("anime_media_type") in ("TV", "ONA"))
+    )
+    non_special = sum(1 for _m, r in grp if r.get("anime_media_type") != "SPECIAL")
+    grounded = sum(1 for _m, r in grp if r.get("imdb_id") or r.get("themoviedb_id") or r.get("thetvdb_id"))
+    max_score = max(float(r.get("score") or 0.0) for _m, r in grp)
+    min_mid = min(int(m) for m, _r in grp)
+    return (primary_hits, non_special, grounded, len(grp), max_score, -min_mid)
 
-    Note: Trakt assigns independent auto-incrementing integer namespaces to `/shows/:id` vs
-    `/movies/:id`, so two unrelated works (a MOVIE and a TV series with distinct IMDb/TMDb IDs)
-    legitimately can share a numeric trakt_id and are NOT treated as collisions.
-    """
+
+def sanitize_trakt_collisions(records):
+    """Clear orphan seed leaks, cross-kind ID overlaps, and same-kind disjoint IMDb/TMDB collisions."""
     by_tid = collections.defaultdict(list)
     for mid, r in records.items():
         tid = parse_pos_int(r.get("trakt_id"))
@@ -1391,7 +1641,7 @@ def sanitize_trakt_collisions(records):
         if len(members) <= 1:
             continue
 
-        # 1. Clear ungrounded orphan entries (no tvdb/tmdb/imdb) sharing a trakt_id owned by grounded siblings
+        # 1. Clear ungrounded orphan entries sharing a trakt_id owned by grounded siblings
         grounded = [
             (m, r) for m, r in members
             if r.get("imdb_id") or r.get("themoviedb_id") or r.get("thetvdb_id")
@@ -1400,60 +1650,78 @@ def sanitize_trakt_collisions(records):
             for _m, r in members:
                 if not (r.get("imdb_id") or r.get("themoviedb_id") or r.get("thetvdb_id")):
                     r["trakt_id"] = None
+                    r["trakt_slug"] = None
                     cleared += 1
 
-        # 2. Clear cross-type leaks within the SAME series IMDb/TMDb (e.g. MOVIE inheriting TV show trakt_id)
+        # 2. Clear cross-type leaks sharing identical IMDb/TMDb/TVDB across movie vs show namespaces
         remaining = [(m, r) for m, r in members if parse_pos_int(r.get("trakt_id")) == tid]
-        by_imdb_all = collections.defaultdict(list)
-        for m, r in remaining:
-            if r.get("imdb_id"):
-                by_imdb_all[r["imdb_id"]].append((m, r))
-        for _imdb, grp in by_imdb_all.items():
-            mv_grp = [(m, r) for m, r in grp if r.get("anime_media_type") == "MOVIE" or r.get("global_media_type") == "movie"]
-            tv_grp = [(m, r) for m, r in grp if r.get("anime_media_type") in ("TV", "ONA")]
-            if mv_grp and tv_grp:
-                # Series IMDb belongs to TV/ONA show; clear leaked show trakt_id from MOVIE entries
-                for _m, r in mv_grp:
+        for id_key in ("imdb_id", "themoviedb_id", "thetvdb_id"):
+            by_shared = collections.defaultdict(list)
+            for m, r in remaining:
+                val = r.get(id_key)
+                if val:
+                    by_shared[val].append((m, r))
+            for _val, grp in by_shared.items():
+                mv_kind = [(m, r) for m, r in grp if _media_kind(r) == "movie" and parse_pos_int(r.get("trakt_id")) == tid]
+                sh_kind = [(m, r) for m, r in grp if _media_kind(r) == "show" and parse_pos_int(r.get("trakt_id")) == tid]
+                if not (mv_kind and sh_kind):
+                    continue
+                tv_core = [(m, r) for m, r in sh_kind if r.get("anime_media_type") in ("TV", "ONA")]
+                mv_core = [(m, r) for m, r in mv_kind if r.get("anime_media_type") == "MOVIE"]
+                victims = mv_kind if (tv_core or id_key == "thetvdb_id" or not mv_core) else sh_kind
+                for _m, r in victims:
                     r["trakt_id"] = None
+                    r["trakt_slug"] = None
                     cleared += 1
 
-        # 3. Within each Trakt namespace ('show' vs 'movie'), clear disconnected disjoint IMDb collisions
+        # 3. Within each Trakt namespace ('show' vs 'movie'), resolve disjoint IMDb and disjoint TMDB collisions
         for kind_filter in ("show", "movie"):
-            kind_members = [
-                (m, r) for m, r in members
-                if parse_pos_int(r.get("trakt_id")) == tid and _media_kind(r) == kind_filter and r.get("imdb_id")
-            ]
-            by_imdb = collections.defaultdict(list)
-            for m, r in kind_members:
-                by_imdb[r["imdb_id"]].append((m, r))
-            if len(by_imdb) > 1:
-                ranked = sorted(by_imdb.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-                top_len = len(ranked[0][1])
-                second_len = len(ranked[1][1])
-                if top_len >= 2 and top_len > second_len:
-                    for _imdb, grp in ranked[1:]:
+            for id_key in ("imdb_id", "themoviedb_id"):
+                kind_members = [
+                    (m, r) for m, r in members
+                    if parse_pos_int(r.get("trakt_id")) == tid and _media_kind(r) == kind_filter and r.get(id_key)
+                ]
+                by_id = collections.defaultdict(list)
+                for m, r in kind_members:
+                    by_id[r[id_key]].append((m, r))
+                if len(by_id) > 1:
+                    ranked = sorted(by_id.items(), key=lambda kv: _trakt_cluster_rank(kv[1], kind_filter), reverse=True)
+                    for _k, grp in ranked[1:]:
                         for _m, r in grp:
                             r["trakt_id"] = None
+                            r["trakt_slug"] = None
                             cleared += 1
     return cleared
 
 
 def propagate_trakt_sibling_ids(records):
-    """Fill missing trakt_id from unambiguous sibling records sharing identical (imdb_id, kind) or (tmdb_id, kind)."""
+    """Fill missing trakt_id/slug from unambiguous sibling records sharing identical (imdb_id, kind) or (tmdb_id, kind)."""
     sanitize_trakt_collisions(records)
     imdb_tids = collections.defaultdict(set)
+    imdb_tmdbs = collections.defaultdict(set)
+    imdb_slugs = collections.defaultdict(set)
     tmdb_tids = collections.defaultdict(set)
+    tmdb_slugs = collections.defaultdict(set)
     for r in records.values():
         tid = parse_pos_int(r.get("trakt_id"))
         if not tid:
             continue
         mt = _media_kind(r)
+        slug = clean_trakt_slug(r.get("trakt_slug"))
         if r.get("imdb_id"):
-            imdb_tids[(r["imdb_id"], mt)].add(tid)
+            ik = (r["imdb_id"], mt)
+            imdb_tids[ik].add(tid)
+            if r.get("themoviedb_id"):
+                imdb_tmdbs[ik].add(r["themoviedb_id"])
+            if slug:
+                imdb_slugs[ik].add(slug)
         if r.get("themoviedb_id"):
-            tmdb_tids[(r["themoviedb_id"], mt)].add(tid)
+            tk = (r["themoviedb_id"], mt)
+            tmdb_tids[tk].add(tid)
+            if slug:
+                tmdb_slugs[tk].add(slug)
 
-    imdb_exact = {k: next(iter(v)) for k, v in imdb_tids.items() if len(v) == 1}
+    imdb_exact = {k: next(iter(v)) for k, v in imdb_tids.items() if len(v) == 1 and len(imdb_tmdbs.get(k, ())) <= 1}
     tmdb_exact = {k: next(iter(v)) for k, v in tmdb_tids.items() if len(v) == 1}
     filled = 0
     for r in records.values():
@@ -1462,11 +1730,22 @@ def propagate_trakt_sibling_ids(records):
         imdb = r.get("imdb_id")
         tmdb = r.get("themoviedb_id")
         mt = _media_kind(r)
-        tid = imdb_exact.get((imdb, mt)) if imdb else None
-        if not tid and tmdb:
-            tid = tmdb_exact.get((tmdb, mt))
+        tid = None
+        slug = None
+        if imdb and (imdb, mt) in imdb_exact:
+            src_tmdbs = imdb_tmdbs.get((imdb, mt), set())
+            if not tmdb or not src_tmdbs or tmdb in src_tmdbs:
+                tid = imdb_exact[(imdb, mt)]
+                slugs = imdb_slugs.get((imdb, mt), set())
+                slug = next(iter(slugs)) if len(slugs) == 1 else None
+        if not tid and tmdb and (tmdb, mt) in tmdb_exact:
+            tid = tmdb_exact[(tmdb, mt)]
+            slugs = tmdb_slugs.get((tmdb, mt), set())
+            slug = next(iter(slugs)) if len(slugs) == 1 else None
         if tid:
             r["trakt_id"] = tid
+            if slug and not r.get("trakt_slug"):
+                r["trakt_slug"] = slug
             filled += 1
     return filled
 
@@ -1508,23 +1787,34 @@ def hydrate_trakt_ids(
                 for mid_s, val in data.items():
                     mid = parse_pos_int(mid_s)
                     tid = parse_pos_int(val.get("trakt_id") if isinstance(val, dict) else val)
+                    slug = clean_trakt_slug(val.get("trakt_slug") if isinstance(val, dict) else None)
                     if mid and tid and mid in records and not records[mid]["trakt_id"]:
                         records[mid]["trakt_id"] = tid
+                        if slug and not records[mid]["trakt_slug"]:
+                            records[mid]["trakt_slug"] = slug
         return {"sibling_filled": 0, "http_requests": 0, "resolved_http": 0}
 
     sibling_filled = propagate_trakt_sibling_ids(records)
 
-    # Index normalized candidate titles for title+year fallback when IMDb/TMDb are absent
+    # Index normalized candidate titles + best English query string for title+year fallback
     titles_by_mid = collections.defaultdict(set)
+    en_query_by_mid = {}
     for mid, r in records.items():
         mt = _norm_trakt_title(r.get("mal_title"))
         if len(mt) >= 3:
             titles_by_mid[mid].add(mt)
+        en = str(r.get("title_english") or "").strip()
+        if len(_norm_trakt_title(en)) >= 3:
+            titles_by_mid[mid].add(_norm_trakt_title(en))
+            en_query_by_mid[mid] = en
     for (amid, _anorm), aval in (aliases_map or {}).items():
         if aval and len(aval) >= 2 and aval[1] != "short":
             at = _norm_trakt_title(aval[0])
             if len(at) >= 4:
                 titles_by_mid[amid].add(at)
+            lrank = aval[2] if len(aval) > 2 else 2
+            if amid not in en_query_by_mid and aval[1] in ("english", "official") and lrank == 0 and len(str(aval[0]).strip()) >= 3:
+                en_query_by_mid[amid] = str(aval[0]).strip()
 
     id_candidates = []
     title_candidates = []
@@ -1543,20 +1833,27 @@ def hydrate_trakt_ids(
     id_candidates.sort(key=lambda mid: _hydration_priority_key(mid, records.get(mid)))
     title_candidates.sort(key=lambda mid: _hydration_priority_key(mid, records.get(mid)))
 
-    # Pass 1: apply cached Trakt IDs & build in-run dedup memo (0 HTTP calls)
+    # Pass 1: apply cached Trakt IDs/slugs & build in-run dedup memo (0 HTTP calls)
     to_fetch = []
     lookup_memo = {}
     for mid in id_candidates:
-        tid = cache.get("trakt", mid, max_age_seconds=30 * 86400)
+        cached_val = cache.get("trakt", mid, max_age_seconds=30 * 86400)
         key = _trakt_lookup_key(records[mid])
-        if tid is None:
+        if cached_val is None:
             to_fetch.append((mid, "id"))
         else:
-            pos_tid = parse_pos_int(tid) or 0
+            if isinstance(cached_val, dict):
+                pos_tid = parse_pos_int(cached_val.get("trakt_id")) or 0
+                c_slug = clean_trakt_slug(cached_val.get("trakt_slug"))
+            else:
+                pos_tid = parse_pos_int(cached_val) or 0
+                c_slug = None
             if key and key not in lookup_memo:
-                lookup_memo[key] = pos_tid
+                lookup_memo[key] = (pos_tid, c_slug)
             if pos_tid and not records[mid]["trakt_id"]:
                 records[mid]["trakt_id"] = pos_tid
+                if c_slug and not records[mid]["trakt_slug"]:
+                    records[mid]["trakt_slug"] = c_slug
 
     for mid in title_candidates:
         cached = cache.get("trakt", f"title_{mid}", max_age_seconds=30 * 86400)
@@ -1601,20 +1898,23 @@ def hydrate_trakt_ids(
         rec = records[mid]
         key = _trakt_lookup_key(rec) if mode == "id" else None
         if key and key in lookup_memo:
-            tid = lookup_memo[key]
-            cache.set("trakt", mid, tid)
+            tid, c_slug = lookup_memo[key]
+            cache.set("trakt", mid, {"trakt_id": tid, "trakt_slug": c_slug} if c_slug else tid)
             if tid and not rec["trakt_id"]:
                 rec["trakt_id"] = int(tid)
+                if c_slug and not rec["trakt_slug"]:
+                    rec["trakt_slug"] = c_slug
                 resolved_http += 1
             continue
 
         if max_items and processed_unique >= max_items:
             continue
         if deadline and time.time() >= deadline:
-            continue
+            break
 
         processed_unique += 1
         tid = 0
+        c_slug = None
         try:
             kind = _media_kind(rec)
             if mode == "id":
@@ -1634,29 +1934,46 @@ def hydrate_trakt_ids(
                     if isinstance(arr, list) and arr:
                         entry = next((e for e in arr if (kind in e)), arr[0])
                         obj = entry.get(kind) or entry.get("show") or entry.get("movie") or {}
-                        tid = parse_pos_int(((obj.get("ids") or {}).get("trakt"))) or 0
+                        ids_obj = obj.get("ids") or {}
+                        tid = parse_pos_int(ids_obj.get("trakt")) or 0
+                        c_slug = clean_trakt_slug(ids_obj.get("slug"))
                 if status in (200, 404, 400):
-                    cache.set("trakt", mid, tid)
+                    cache.set("trakt", mid, {"trakt_id": tid, "trakt_slug": c_slug} if c_slug else tid)
                     if key:
-                        lookup_memo[key] = tid
+                        lookup_memo[key] = (tid, c_slug)
                 if parse_pos_int(tid) and not rec["trakt_id"]:
                     rec["trakt_id"] = int(tid)
+                    if c_slug and not rec["trakt_slug"]:
+                        rec["trakt_slug"] = c_slug
                     resolved_http += 1
             else:
                 q_title = str(rec.get("mal_title") or "").strip()
+                en_title = en_query_by_mid.get(mid, "")
+                queries = [q_title] if q_title else []
+                if en_title and en_title.lower() != q_title.lower():
+                    queries.append(en_title)
                 yr = parse_pos_int(rec.get("year"))
-                url = (
-                    f"https://api.trakt.tv/search/{kind}"
-                    f"?query={urllib.parse.quote(q_title)}&years={max(1950, yr - 1)}-{yr + 1}"
-                )
-                raw, status = _trakt_get_with_retry(url)
-                if status == 429:
-                    break
                 hit = None
-                if status == 200 and raw:
-                    arr = json.loads(raw.decode("utf-8"))
-                    hit = _match_trakt_title_year_candidate(arr, rec, kind, titles_by_mid.get(mid))
-                if status in (200, 404, 400):
+                last_status = 0
+                for q_str in queries[:2]:
+                    if deadline and time.time() >= deadline:
+                        break
+                    url = (
+                        f"https://api.trakt.tv/search/{kind}"
+                        f"?query={urllib.parse.quote(q_str)}&years={max(1950, yr - 1)}-{yr + 1}"
+                    )
+                    raw, status = _trakt_get_with_retry(url)
+                    last_status = status
+                    if status == 429:
+                        break
+                    if status == 200 and raw:
+                        arr = json.loads(raw.decode("utf-8"))
+                        hit = _match_trakt_title_year_candidate(arr, rec, kind, titles_by_mid.get(mid))
+                        if hit:
+                            break
+                if last_status == 429:
+                    break
+                if last_status in (200, 404, 400):
                     cache.set("trakt", f"title_{mid}", hit if hit else 0)
                 if hit and _apply_trakt_payload(rec, hit):
                     resolved_http += 1
@@ -1667,7 +1984,7 @@ def hydrate_trakt_ids(
             if mode == "id":
                 cache.set("trakt", mid, 0)
                 if key:
-                    lookup_memo[key] = 0
+                    lookup_memo[key] = (0, None)
             else:
                 cache.set("trakt", f"title_{mid}", 0)
 
@@ -1763,10 +2080,22 @@ def _apply_simkl(records, mal_id, sk, ep_counts):
         title = (sk.get("title") or "").strip()
         if title:
             rec["mal_title"] = title
+    en_title = (sk.get("en_title") or "").strip()
+    if en_title and not rec["title_english"]:
+        rec["title_english"] = en_title
+    if not rec["start_date"]:
+        sd = _format_start_date(sk.get("first_aired"))
+        if sd:
+            rec["start_date"] = sd
+    if not rec["genres"] and sk.get("genres"):
+        gs = _format_canonical_genres(sk.get("genres"), whitelist_only=False)
+        if gs:
+            rec["genres"] = gs
 
     tot_eps = parse_pos_int(sk.get("total_episodes"))
     if tot_eps and mal_id not in ep_counts:
         ep_counts[mal_id] = tot_eps
+        rec["episodes"] = tot_eps
         rec["anime_media_episodes"] = format_episode_range(1, tot_eps)
         if not rec["global_media_episodes"]:
             rec["global_media_episodes"] = format_episode_range(1, tot_eps)
@@ -1817,7 +2146,11 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
                     r.get("anime_media_type") in ("TV", "ONA")
                     and (
                         (r.get("thetvdb_part") or 1) > 1
-                        or (r.get("thetvdb_id") and tvdb_counts.get(r["thetvdb_id"], 0) >= 2 and mid >= 30000)
+                        or (
+                            r.get("thetvdb_id")
+                            and tvdb_counts.get(r["thetvdb_id"], 0) >= 2
+                            and (mid >= 30000 or r.get("thetvdb_season") is None)
+                        )
                     )
                 )
             )
@@ -1878,7 +2211,7 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
         if want_az or want_sk:
             uncached_queue.append((mid, want_az, want_sk, ttl))
 
-    ms_items = malsync_queue[:min(80, max_items)]
+    ms_items = malsync_queue[:max_items]
     if ms_items and not (deadline and time.time() >= deadline):
         def _fetch_malsync_worker(mid):
             if deadline and time.time() >= deadline:
@@ -1968,6 +2301,7 @@ def _apply_anizip(records, mal_id, az, ep_counts):
     ep_count = parse_pos_int(az.get("episodeCount"))
     if ep_count and mal_id not in ep_counts:
         ep_counts[mal_id] = ep_count
+        rec["episodes"] = ep_count
         rec["anime_media_episodes"] = format_episode_range(1, ep_count)
         if not rec["global_media_episodes"]:
             rec["global_media_episodes"] = format_episode_range(1, ep_count)
@@ -2098,18 +2432,25 @@ def _parse_afl_show_html(raw_html, slug=""):
     return {"slug": slug, "title": title, "max_ep": max_ep, "episodes": non_canon}
 
 
+_AFL_FILLER_PRIORITY = {"Filler": 0, "Mixed Canon/Filler": 1, "Recap": 2}
+_AFL_VARIANT_SUFFIXES = ("-0", "-manga-canon", "-definitive-filler-list", "-filler-list")
+
+
 def _coalesce_filler_ranges(per_ep_entries):
-    """Collapse sorted (mal_id, episode, filler_type) tuples into contiguous (mal_id, ep_start, ep_end, filler_type)."""
+    """Collapse deduplicated (mal_id, episode, filler_type) tuples into non-overlapping ranges."""
     ranges = []
     if not per_ep_entries:
         return ranges
-    ordered = sorted(set(per_ep_entries), key=lambda x: (x[0], x[1], x[2]))
+    by_ep = {}
+    for mid, ep, ftype in per_ep_entries:
+        prev = by_ep.get((mid, ep))
+        if prev is None or _AFL_FILLER_PRIORITY.get(ftype, 9) < _AFL_FILLER_PRIORITY.get(prev, 9):
+            by_ep[(mid, ep)] = ftype
+    ordered = sorted((mid, ep, ftype) for (mid, ep), ftype in by_ep.items())
     cur_mid, cur_start, cur_end, cur_type = ordered[0][0], ordered[0][1], ordered[0][1], ordered[0][2]
     for mid, ep, ftype in ordered[1:]:
         if mid == cur_mid and ftype == cur_type and ep == cur_end + 1:
             cur_end = ep
-        elif mid == cur_mid and ftype == cur_type and ep == cur_end:
-            continue
         else:
             ranges.append((cur_mid, cur_start, cur_end, cur_type))
             cur_mid, cur_start, cur_end, cur_type = mid, ep, ep, ftype
@@ -2155,6 +2496,8 @@ def _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_co
 
     for mid, rec in records.items():
         _register_title(mid, rec.get("mal_title"), 0)
+        if rec.get("title_english"):
+            _register_title(mid, rec.get("title_english"), 1)
     for (mid, _norm), alias_val in (aliases_map or {}).items():
         clean_t = alias_val[0]
         ttype = alias_val[1]
@@ -2183,8 +2526,7 @@ def _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_co
     for tid in tvdb_series:
         tvdb_series[tid].sort()
 
-    per_ep_entries = []
-    matched_shows = 0
+    best_show_for_root = {}
     for show in shows:
         ep_map = show.get("episodes") or {}
         if not ep_map:
@@ -2197,15 +2539,26 @@ def _map_afl_shows_to_ranges(shows, records, aliases_map, franchise_links, ep_co
         ]
         cands = []
         seen_norms = set()
-        for norm in cand_norms:
+        for norm_idx, norm in enumerate(cand_norms):
             if norm and norm not in seen_norms and norm in title_index:
                 seen_norms.add(norm)
-                cands.extend(title_index[norm])
+                for rank, mid in title_index[norm]:
+                    cands.append(((norm_idx,) + rank, mid))
         if not cands:
             continue
         cands.sort(key=lambda x: x[0])
         root_mid = cands[0][1]
-        matched_shows += 1
+        is_variant = 1 if slug.endswith(_AFL_VARIANT_SUFFIXES) else 0
+        max_ep_cand = parse_pos_int(show.get("max_ep")) or max(int(k) for k in ep_map)
+        quality = (is_variant, -len(ep_map), -max_ep_cand, slug)
+        prev = best_show_for_root.get(root_mid)
+        if prev is None or quality < prev[0]:
+            best_show_for_root[root_mid] = (quality, show)
+
+    per_ep_entries = []
+    matched_shows = len(best_show_for_root)
+    for root_mid, (_quality, show) in sorted(best_show_for_root.items()):
+        ep_map = show.get("episodes") or {}
 
         max_ep = parse_pos_int(show.get("max_ep")) or max(int(k) for k in ep_map)
         root_eps = ep_counts.get(root_mid) or 0
@@ -2350,7 +2703,7 @@ def apply_prequel_inheritance(records, prequel_edges, manami_related):
         for mid, rec in records.items():
             if rec.get("anime_media_type") not in ("TV", "ONA"):
                 continue
-            if rec.get("thetvdb_id") and rec.get("themoviedb_id"):
+            if rec.get("thetvdb_id") and rec.get("themoviedb_id") and rec.get("thetvdb_season") is not None:
                 continue
             pre_candidates = list(prequel_edges.get(mid) or [])
             if not pre_candidates and mid in manami_related:
@@ -2387,12 +2740,12 @@ def apply_prequel_inheritance(records, prequel_edges, manami_related):
             break
 
 
-def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None):
-    """Compute missing thetvdb_part ordinals, enforce SQLite UNIQUE cols, and prune empty/synthetic shells.
+def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None, ep_counts=None, aliases_map=None):
+    """Compute missing thetvdb_part ordinals, fill integer episodes & title_english, and prune orphan shells.
 
-    Returns:
-        int: Count of empty orphan or stale synthetic (>64000 non-Manami with zero external IDs)
-            records pruned after uniqueness deduplication.
+    Note: As of v2.6, multi-cour/split siblings preserve their shared ``anidb_id``,
+    ``simkl_id``, ``anilist_id``, and ``kitsu_id`` values (non-unique indexed)
+    while deterministic ``ORDER BY mal_id ASC`` queries still resolve the primary entry first.
     """
     groups = collections.defaultdict(list)
     for mid, rec in records.items():
@@ -2415,29 +2768,51 @@ def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None
                 if r["thetvdb_part"] is None:
                     r["thetvdb_part"] = idx
 
-    # Enforce UNIQUE constraints deterministically across non-primary columns:
-    # records sorted by mal_id ascending (older canonical entries keep unique claim)
-    seen = {col: set() for col in ("anilist_id", "kitsu_id", "anidb_id", "simkl_id")}
-    for mid in sorted(records.keys()):
-        rec = records[mid]
-        for col in seen:
-            val = rec.get(col)
-            if val is None:
+    # Backfill title_english from English aliases where missing
+    if aliases_map:
+        best_en = {}
+        for (amid, _norm), aval in aliases_map.items():
+            if amid not in records or records[amid].get("title_english"):
                 continue
-            if val in seen[col]:
-                rec[col] = None
-            else:
-                seen[col].add(val)
+            if not aval or len(aval) < 2:
+                continue
+            ttype = aval[1]
+            lrank = aval[2] if len(aval) > 2 else 2
+            if (ttype in ("english", "official") and lrank == 0) or (ttype == "english"):
+                prio = 0 if ttype == "english" else 1
+                prev = best_en.get(amid)
+                if prev is None or (prio, len(aval[0])) < (prev[0], len(prev[1])):
+                    best_en[amid] = (prio, aval[0])
+        for amid, (_p, en_t) in best_en.items():
+            records[amid]["title_english"] = en_t
 
-    # Prune empty orphan rows and stale synthetic (>64000 non-Manami) rows left with zero external IDs
+    # Ensure integer episodes column is consistently populated from ep_counts or anime_media_episodes
+    for mid, rec in records.items():
+        if not rec.get("episodes"):
+            eps = parse_pos_int((ep_counts or {}).get(mid))
+            if not eps:
+                rng = parse_range_tuple(rec.get("anime_media_episodes"))
+                if rng:
+                    eps = rng[1] if rng[0] == 1 else max(1, rng[1] - rng[0] + 1)
+            if eps:
+                rec["episodes"] = eps
+
+    # Prune empty orphan rows and untitled stale synthetic (>64000 non-Manami) seed shells
     _ = seed_ids  # retained for explicit caller diagnostics
     pruned = 0
     for mid in list(records.keys()):
         rec = records[mid]
-        if any(rec.get(c) is not None for c in _EXTERNAL_ID_COLS):
-            continue
-        is_empty_shell = rec.get("mal_title") is None and rec.get("status") is None
-        is_stale_synthetic = mid > 64000 and (canonical_mal_ids is None or mid not in canonical_mal_ids)
+        is_empty_shell = (
+            rec.get("mal_title") is None
+            and rec.get("status") is None
+            and not any(rec.get(c) is not None for c in _EXTERNAL_ID_COLS)
+        )
+        is_stale_synthetic = (
+            mid > 64000
+            and (canonical_mal_ids is not None and mid not in canonical_mal_ids)
+            and rec.get("mal_title") is None
+            and rec.get("status") is None
+        )
         if is_empty_shell or is_stale_synthetic:
             del records[mid]
             pruned += 1
@@ -2464,11 +2839,12 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
             "CREATE TABLE anime ("
             "mal_id INTEGER PRIMARY KEY, mal_dub_id INTEGER, anilist_id INTEGER, "
             "kitsu_id INTEGER, anidb_id INTEGER, simkl_id INTEGER, thetvdb_id INTEGER, "
-            "themoviedb_id INTEGER, imdb_id INTEGER, trakt_id INTEGER, mal_title TEXT COLLATE NOCASE, "
+            "themoviedb_id INTEGER, imdb_id TEXT, trakt_id INTEGER, mal_title TEXT COLLATE NOCASE, "
             "mal_picture TEXT, thetvdb_season INTEGER, thetvdb_part INTEGER, "
             "duration INTEGER, score REAL, status TEXT, anime_media_type TEXT, "
             "global_media_type TEXT, anime_media_episodes TEXT, global_media_episodes TEXT, "
-            "year INTEGER, anime_season TEXT, "
+            "year INTEGER, anime_season TEXT, episodes INTEGER, title_english TEXT COLLATE NOCASE, "
+            "genres TEXT, studios TEXT, start_date TEXT, trakt_slug TEXT, "
             "UNIQUE(mal_id))"
         )
         conn.execute(
@@ -2598,6 +2974,32 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
         for stmt in INDEXED_STATEMENTS:
             conn.execute(stmt)
 
+        # Build compact contentless FTS5 search index keyed by rowid = mal_id
+        conn.execute(
+            "CREATE VIRTUAL TABLE anime_fts USING fts5("
+            "mal_title, title_english, aliases_text, "
+            "content='', tokenize='unicode61 remove_diacritics 2')"
+        )
+        aliases_by_mid = collections.defaultdict(list)
+        for (amid, _norm), aval in sorted((aliases_map or {}).items()):
+            if amid in records and aval:
+                aliases_by_mid[amid].append(aval[0])
+        fts_rows = [
+            (
+                mid,
+                records[mid].get("mal_title") or "",
+                records[mid].get("title_english") or "",
+                " | ".join(aliases_by_mid.get(mid, ())),
+            )
+            for mid in sorted(records.keys())
+        ]
+        if fts_rows:
+            conn.executemany(
+                "INSERT INTO anime_fts (rowid, mal_title, title_english, aliases_text) VALUES (?, ?, ?, ?)",
+                fts_rows,
+            )
+            conn.execute("INSERT INTO anime_fts(anime_fts) VALUES('optimize')")
+
         conn.commit()
         conn.execute("ANALYZE")
         conn.commit()
@@ -2621,7 +3023,11 @@ def compute_stats(records):
         counts[col] = sum(1 for r in records.values() if r.get(col) not in (None, ""))
     recent = [r for mid, r in records.items() if mid >= 55000]
     counts["recent_total"] = len(recent)
-    for col in ("anilist_id", "kitsu_id", "anidb_id", "simkl_id", "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_dub_id"):
+    for col in (
+        "anilist_id", "kitsu_id", "anidb_id", "simkl_id", "thetvdb_id",
+        "themoviedb_id", "imdb_id", "trakt_id", "mal_dub_id",
+        "title_english", "genres", "studios", "start_date",
+    ):
         counts[f"recent_{col}"] = sum(1 for r in recent if r.get(col) not in (None, ""))
     return {"total_rows": total, "columns": counts}
 
@@ -2695,11 +3101,12 @@ def build_pipeline(args):
     xml_rules = merge_anime_lists_xml(records, xml_bytes, ep_counts, offsets)
     merge_kometa(records, kometa_bytes, ep_counts, offsets)
     merge_wikidata(records, wikidata_bytes)
-    merge_plexanibridge(records, plexanibridge_bytes)
+    pab_rules = []
+    merge_plexanibridge(records, plexanibridge_bytes, rules=pab_rules)
     merge_anidb_titles(records, anidb_titles_bytes, aliases_map=aliases_map)
     merge_mal_dubs(records, dubs_bytes)
 
-    extra_rules = []
+    extra_rules = list(pab_rules)
     prequel_edges = {}
     wall_deadline = 0.0
     if args.api_budget_seconds > 0 or args.offline_fixtures:
@@ -2712,9 +3119,9 @@ def build_pipeline(args):
             records, cache, ep_counts, args.offline_fixtures,
             deadline=anilist_deadline, franchise_links=franchise_links, aliases_map=aliases_map,
         )
-        extra_rules = hydrate_anizip_and_malsync(
+        extra_rules.extend(hydrate_anizip_and_malsync(
             records, cache, ep_counts, args.offline_fixtures, max_items=args.max_api_items, deadline=anizip_deadline
-        )
+        ))
         hydrate_trakt_ids(
             records, cache, args.offline_fixtures,
             max_items=min(1000, args.max_api_items), deadline=trakt_deadline, aliases_map=aliases_map,
@@ -2722,7 +3129,9 @@ def build_pipeline(args):
 
     apply_prequel_inheritance(records, prequel_edges, manami_related)
     sanitize_trakt_collisions(records)
-    pruned_shells = finalize_parts_and_uniqueness(records, seed_ids=seed_ids, canonical_mal_ids=manami_mal_ids)
+    pruned_shells = finalize_parts_and_uniqueness(
+        records, seed_ids=seed_ids, canonical_mal_ids=manami_mal_ids, ep_counts=ep_counts, aliases_map=aliases_map,
+    )
 
     # Add symmetric inverse PREQUEL <-> SEQUEL edges + Manami RELATED fallback before AFL chain mapping
     explicit_pairs = set()
@@ -2778,6 +3187,15 @@ def build_pipeline(args):
     filler_ranges = [r for r in filler_ranges if r[0] in records]
 
     all_rules = xml_rules + extra_rules
+    # Compute final counts matching exactly what write_sqlite_database persists
+    valid_rules_count = len({
+        (rl["mal_id"], rl["season"], rl["rule_type"], rl["range_start"], rl["ep_start"])
+        for rl in all_rules
+        if rl["mal_id"] in records
+        and (not rl.get("tvdb_id") or not records[rl["mal_id"]].get("thetvdb_id") or rl["tvdb_id"] == records[rl["mal_id"]]["thetvdb_id"])
+        and (rl.get("range_start") or 0) >= 1 and (rl.get("ep_start") or 0) >= 1
+        and rl.get("season") is not None and rl["season"] >= 0
+    })
     stats = compute_stats(records)
     write_sqlite_database(
         args.output, records, all_rules, stats,
@@ -2808,7 +3226,7 @@ def build_pipeline(args):
         "seed_rows": seed_count,
         "pruned_seed_shells": pruned_shells,
         "total_rows": len(records),
-        "rule_count": len(all_rules),
+        "rule_count": valid_rules_count,
         "alias_count": len(aliases_map),
         "franchise_link_count": len(franchise_links),
         "schedule_id_count": len(schedule_ids),
@@ -2856,7 +3274,8 @@ def build_pipeline(args):
             f"- **Coverage**: `anilist_id={c['anilist_id']:,}`, `kitsu_id={c['kitsu_id']:,}`, "
             f"`anidb_id={c['anidb_id']:,}`, `simkl_id={c['simkl_id']:,}`, `thetvdb_id={c['thetvdb_id']:,}`, "
             f"`themoviedb_id={c['themoviedb_id']:,}`, `imdb_id={c['imdb_id']:,}`, `trakt_id={c['trakt_id']:,}`, "
-            f"`mal_dub_id={c['mal_dub_id']:,}`, `year={c['year']:,}`, `anime_season={c['anime_season']:,}`\n"
+            f"`mal_dub_id={c['mal_dub_id']:,}`, `episodes={c.get('episodes', 0):,}`, `genres={c.get('genres', 0):,}`, "
+            f"`studios={c.get('studios', 0):,}`, `year={c['year']:,}`, `anime_season={c['anime_season']:,}`\n"
             f"- **Recent (`mal_id >= 55000`, n=`{c['recent_total']:,}`)**: "
             f"`thetvdb_id={c['recent_thetvdb_id']:,}`, `themoviedb_id={c['recent_themoviedb_id']:,}`, "
             f"`anidb_id={c['recent_anidb_id']:,}`, `trakt_id={c['recent_trakt_id']:,}`\n"
@@ -2866,7 +3285,7 @@ def build_pipeline(args):
 
     print(
         f"Built {args.output}: {len(records):,} rows ({len(records) - seed_count:+,} vs seed, "
-        f"pruned {pruned_shells} empty shells), {len(all_rules):,} rules, {raw_size:,} bytes"
+        f"pruned {pruned_shells} empty shells), {valid_rules_count:,} rules, {raw_size:,} bytes"
         + (f", xz={xz_size:,} bytes" if xz_size else "")
         + f" in {manifest['build_seconds']}s"
     )

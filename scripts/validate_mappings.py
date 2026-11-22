@@ -10,14 +10,15 @@ import re
 import sqlite3
 import sys
 
-REQUIRED_TABLES = ("anime", "activities", "tvdb_rules", "anime_aliases", "franchise_links", "schedule_ids", "filler_ranges", "build_meta")
+REQUIRED_TABLES = ("anime", "activities", "tvdb_rules", "anime_aliases", "franchise_links", "schedule_ids", "filler_ranges", "anime_fts", "build_meta")
 _VALID_FILLER_TYPES = ("Filler", "Mixed Canon/Filler", "Recap")
 REQUIRED_COLUMNS = (
     "mal_id", "mal_dub_id", "anilist_id", "kitsu_id", "anidb_id", "simkl_id",
     "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id", "mal_title", "mal_picture",
     "thetvdb_season", "thetvdb_part", "duration", "score", "status",
     "anime_media_type", "global_media_type", "anime_media_episodes", "global_media_episodes",
-    "year", "anime_season",
+    "year", "anime_season", "episodes", "title_english", "genres", "studios",
+    "start_date", "trakt_slug",
 )
 INDEXED_LOOKUP_COLUMNS = (
     ("mal_id", 1),
@@ -155,6 +156,64 @@ def validate_database(
         if "SCAN anime" in like_plan or "SEARCH anime" not in like_plan:
             errors.append(f"mal_title prefix LIKE does not use NOCASE index SEARCH: query plan = '{like_plan}'")
 
+        # Ensure seasonal composite browse + TVDB ordered sibling queries avoid full scans / TEMP B-TREE sorts
+        season_plan = " | ".join(
+            str(r[-1])
+            for r in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT mal_id FROM anime "
+                "WHERE year = 2024 AND anime_season = 'FALL' AND anime_media_type = 'TV' "
+                "ORDER BY score DESC, mal_id DESC"
+            ).fetchall()
+        )
+        if "SCAN anime" in season_plan or "TEMP B-TREE" in season_plan:
+            errors.append(f"Seasonal browse query uses scan/temp sort: '{season_plan}'")
+
+        tvdb_plan = " | ".join(
+            str(r[-1])
+            for r in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT mal_id FROM anime "
+                "WHERE thetvdb_id = 1 ORDER BY thetvdb_season, thetvdb_part"
+            ).fetchall()
+        )
+        if "SCAN anime" in tvdb_plan or "TEMP B-TREE" in tvdb_plan:
+            errors.append(f"TVDB sibling query uses scan/temp sort: '{tvdb_plan}'")
+
+        # Verify zero disjoint IMDb/TMDB Trakt collisions within a namespace and zero shared-ID cross-kind leaks
+        trakt_same_coll = conn.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT trakt_id, (CASE WHEN anime_media_type='MOVIE' OR global_media_type='movie' THEN 'movie' ELSE 'show' END) AS kind "
+            "  FROM anime WHERE trakt_id IS NOT NULL "
+            "  GROUP BY trakt_id, kind "
+            "  HAVING COUNT(DISTINCT imdb_id) > 1 OR COUNT(DISTINCT themoviedb_id) > 1"
+            ")"
+        ).fetchone()[0]
+        if trakt_same_coll:
+            errors.append(f"Found {trakt_same_coll} same-kind trakt_id disjoint IMDb/TMDb collisions")
+
+        trakt_cross_leak = conn.execute(
+            "SELECT COUNT(*) FROM anime a JOIN anime b ON a.trakt_id = b.trakt_id AND a.mal_id < b.mal_id "
+            "WHERE a.trakt_id IS NOT NULL "
+            "AND (CASE WHEN a.anime_media_type='MOVIE' OR a.global_media_type='movie' THEN 'movie' ELSE 'show' END) != "
+            "    (CASE WHEN b.anime_media_type='MOVIE' OR b.global_media_type='movie' THEN 'movie' ELSE 'show' END) "
+            "AND ((a.imdb_id IS NOT NULL AND a.imdb_id = b.imdb_id) "
+            "  OR (a.themoviedb_id IS NOT NULL AND a.themoviedb_id = b.themoviedb_id) "
+            "  OR (a.thetvdb_id IS NOT NULL AND a.thetvdb_id = b.thetvdb_id))"
+        ).fetchone()[0]
+        if trakt_cross_leak:
+            errors.append(f"Found {trakt_cross_leak} cross-kind trakt_id leaks sharing IMDb/TMDb/TVDB")
+
+        if "anime_fts" in tables:
+            fts_plan = " | ".join(
+                str(r[-1])
+                for r in conn.execute("EXPLAIN QUERY PLAN SELECT rowid FROM anime_fts WHERE anime_fts MATCH 'Bebop'").fetchall()
+            )
+            if "SCAN anime_fts" not in fts_plan and "VIRTUAL TABLE INDEX" not in fts_plan:
+                errors.append(f"Unexpected anime_fts query plan: '{fts_plan}'")
+            doc_tbl = "anime_fts_docsize" if "anime_fts_docsize" in tables else "anime_fts"
+            fts_cnt = conn.execute(f'SELECT COUNT(*) FROM "{doc_tbl}"').fetchone()[0]
+            if fts_cnt != total_rows:
+                errors.append(f"anime_fts row count mismatch: fts={fts_cnt} vs anime={total_rows}")
+
         idx_names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
 
         # Verify v2.2 relational index existence, query plan, & zero dangling foreign IDs
@@ -262,6 +321,12 @@ def validate_database(
                 ).fetchone()[0]
                 if total_rows < base_rows * (1.0 - max_regression_ratio):
                     errors.append(f"Total rows regressed from {base_rows} to {total_rows}")
+                base_schema = ""
+                try:
+                    row_sv = bconn.execute("SELECT value FROM build_meta WHERE key='schema_version'").fetchone()
+                    base_schema = str(row_sv[0] or "") if row_sv else ""
+                except sqlite3.Error:
+                    base_schema = ""
                 for col in (
                     "anilist_id", "kitsu_id", "anidb_id", "simkl_id",
                     "thetvdb_id", "themoviedb_id", "imdb_id", "trakt_id",
@@ -269,7 +334,11 @@ def validate_database(
                 ):
                     cur_c = _col_count(conn, col)
                     base_c = _col_count(bconn, col)
-                    if cur_c < base_c * (1.0 - max_regression_ratio):
+                    col_tol = max_regression_ratio
+                    # Allow up to 1.5% one-time Trakt collision pruning when upgrading from pre-2.6 seeds
+                    if col == "trakt_id" and (not base_schema or tuple(int(p) for p in base_schema.split(".")[:2] if p.isdigit()) < (2, 6)):
+                        col_tol = max(max_regression_ratio, 0.015)
+                    if cur_c < base_c * (1.0 - col_tol):
                         errors.append(f"Coverage regression in '{col}': baseline={base_c}, candidate={cur_c}")
             finally:
                 bconn.close()

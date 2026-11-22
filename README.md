@@ -2,7 +2,7 @@
 
 Automated, indexed, cryptographically verified anime cross-platform mapping database forked from [Goldenfreddy0703/Otaku-Mappings](https://github.com/Goldenfreddy0703/Otaku-Mappings) for **Otaku-RPDev**.
 
-Rather than committing static 6 MB SQLite binaries into Git history, a daily GitHub Actions pipeline (`.github/workflows/update-mappings.yml`) rebuilds, validates, indexes, compresses (`.xz` ~1.8 MB), and publishes `anime_mappings.db` cleanly to rolling `latest` and dated `vYYYY.MM.DD` GitHub Releases.
+Rather than committing static SQLite binaries into Git history, a daily GitHub Actions pipeline (`.github/workflows/update-mappings.yml`) rebuilds, validates, indexes, compresses (`.xz` ~5.8 MB), and publishes `anime_mappings.db` cleanly to rolling `latest` and dated `vYYYY.MM.DD` GitHub Releases.
 
 ---
 
@@ -26,14 +26,15 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
 
 ## Schema & Performance Enhancements
 
-- **Backward-Compatible Extended `anime` Table (`v2.4`–`v2.5`)**: Preserves all 21 core columns (`mal_id`, `mal_dub_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_title`, `mal_picture`, `thetvdb_season`, `thetvdb_part`, `duration`, `score`, `status`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`) and adds indexed `year` (`INTEGER`) and `anime_season` (`WINTER`/`SPRING`/`SUMMER`/`FALL`), plus concurrent `v2.5` AniZip/Simkl/AFL hydration and Trakt title+year fallback.
-- **Zero Full-Table Scans**: Adds B-tree indexes on `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, `mal_title`, and `year`, plus `ANALYZE` statistics and `VACUUM` optimization for `file:...db?mode=ro` readers.
-- **Additive Tables**:
-  - `tvdb_rules`: Split-cour, special, and `absolute_start` episode mapping rules from `Anime-Lists` XML and `MALSync`.
-  - `anime_aliases`: Compact `WITHOUT ROWID` indexed multi-language alternate titles (`Manami` synonyms, `AniDB` `x-jat`/`en`/`short`, `AniList` English/Romaji/synonyms) for instant offline search and scraper matching (`ix_aliases_title`).
-  - `franchise_links`: Compact `WITHOUT ROWID` bidirectional franchise graph (`PREQUEL`, `SEQUEL`, `SIDE_STORY`, `SPIN_OFF`, `PARENT`, `ALTERNATIVE`, `SUMMARY`, `RELATED`) for chronological season/sequel navigation (`ix_franchise_rel`).
+- **Backward-Compatible Extended `anime` Table (`v2.4`–`v2.6`)**: Preserves all 21 core columns (`mal_id`, `mal_dub_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_title`, `mal_picture`, `thetvdb_season`, `thetvdb_part`, `duration`, `score`, `status`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`), adds indexed `year` (`INTEGER`) and `anime_season` (`WINTER`/`SPRING`/`SUMMER`/`FALL`), and in **`v2.6`** fixes `imdb_id` to `TEXT`, adds `episodes` (`INTEGER`), `title_english`, `genres`, `studios`, `start_date`, and `trakt_slug`, preserves shared `anidb_id`/`simkl_id`/`anilist_id`/`kitsu_id` across multi-cour siblings, and eliminates same-kind Trakt IMDb/TMDb collisions.
+- **Zero Full-Table Scans**: Composite indexes on `(year, anime_season, anime_media_type, score DESC, mal_id DESC)`, `(thetvdb_id, thetvdb_season, thetvdb_part)`, `(anidb_id, mal_id)`, `(anilist_id, mal_id)`, `(kitsu_id, mal_id)`, `(simkl_id, mal_id)`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, and `mal_title` (`ANALYZE` + `VACUUM` for `file:...db?mode=ro` readers).
+- **Additive Tables (`v2.2`–`v2.6`)**:
+  - `anime_fts` (`v2.6`): SQLite FTS5 (`unicode61 remove_diacritics 2`) virtual table indexed by `rowid = mal_id` over `mal_title`, `title_english`, and `aliases_text` for instant sub-millisecond full-text & diacritic-insensitive offline search.
+  - `tvdb_rules`: Split-cour, special, and `absolute_start` episode mapping rules from `Anime-Lists` XML, `PlexAniBridge`, and `MALSync`.
+  - `anime_aliases`: Compact `WITHOUT ROWID` indexed multi-language alternate titles (`Manami` synonyms, `AniDB` `x-jat`/`en`/`short`, `AniList` English/Romaji/synonyms) (`ix_aliases_title`).
+  - `franchise_links`: Compact `WITHOUT ROWID` bidirectional franchise graph (`PREQUEL`, `SEQUEL`, `SIDE_STORY`, `SPIN_OFF`, `PARENT`, `ALTERNATIVE`, `SUMMARY`, `RELATED`) (`ix_franchise_rel`).
   - `schedule_ids`: `syobocal_tid` & `annict_id` Japanese broadcast schedule cross-references from `kawaiioverflow/arm`.
-  - `filler_ranges`: Compact `WITHOUT ROWID` non-canon episode ranges (`(mal_id, ep_start, ep_end, filler_type)`) for offline `[FILLER]`/`[RECAP]`/`[MIXED]` badges and binge auto-skip (`v2.3`).
+  - `filler_ranges`: Compact `WITHOUT ROWID` non-canon episode ranges (`(mal_id, ep_start, ep_end, filler_type)`) (`v2.3`).
   - `build_meta`: Schema version, UTC build timestamp, row/rule/alias/franchise/filler totals, and JSON coverage summary.
 
 ---
@@ -41,7 +42,7 @@ Rather than committing static 6 MB SQLite binaries into Git history, a daily Git
 ## Release Assets (`releases/latest`)
 
 Each scheduled run uploads:
-- `anime_mappings.db.xz` (~1.8 MB LZMA compressed)
+- `anime_mappings.db.xz` (~5.8 MB LZMA compressed)
 - `anime_mappings.db` (uncompressed SQLite DB)
 - `manifest.json` (timestamps, row counts, coverage metrics, SHA-256 digests)
 - `SHA256SUMS.txt` / `MD5SUMS.txt`
@@ -56,11 +57,11 @@ Direct rolling URLs:
 
 ```bash
 # Run hermetic offline unit tests
-python3 -m unittest discover -s tests -p "test_*.py" -v
+python3 -W default -m unittest discover -s tests -p "test_*.py" -v
 
 # Build locally using cached/live feeds + seed preservation
-python3 scripts/build_mappings.py --seed anime_mappings.db --output dist/anime_mappings.db --compress-xz --manifest dist/manifest.json --cache-dir .cache
+python3 scripts/build_mappings.py --seed .seed/v23_baseline.db --output dist/anime_mappings.db --compress-xz --manifest dist/manifest.json --cache-dir .cache
 
 # Run strict integrity, index query-plan, hygiene & baseline monotone validation
-python3 scripts/validate_mappings.py --db dist/anime_mappings.db --baseline anime_mappings.db --xz dist/anime_mappings.db.xz --manifest dist/manifest.json --min-rows 30000 --require-canonical-spots
+python3 scripts/validate_mappings.py --db dist/anime_mappings.db --baseline .seed/v23_baseline.db --xz dist/anime_mappings.db.xz --manifest dist/manifest.json --min-rows 30000 --require-canonical-spots
 ```

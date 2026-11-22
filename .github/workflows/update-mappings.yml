@@ -43,7 +43,7 @@ jobs:
           python-version: '3.12'
 
       - name: Run Hermetic Pipeline Tests
-        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+        run: python3 -W default -m unittest discover -s tests -p "test_*.py" -v
 
   build-and-publish:
     name: Build, Validate & Publish Mapping DB
