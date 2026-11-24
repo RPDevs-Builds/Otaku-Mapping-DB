@@ -62,9 +62,10 @@ flowchart TD
         DB_XL["anime_metadata_animelists_xml.db (10,793 entries / 1,893 mappings)"]
         DB_WD["anime_metadata_wikidata_ids.db (14,609 bindings)"]
         DB_MD["anime_metadata_mal_dubs.db (5,955 dub IDs)"]
-        DB_TR["anime_metadata_trakt_ids.db (12,841 Trakt mappings)"]
+        DB_TR["anime_metadata_trakt_ids.db (12,878 Trakt mappings / 4,832 slugs)"]
         DB_SK["anime_metadata_simkl_catalog.db (14,175 Simkl entries)"]
-        DB_AZ["anime_metadata_anizip_mappings.db (AniZip mappings)"]
+        DB_AZ["anime_metadata_anizip_mappings.db (611 AniZip records)"]
+        DB_ML["anime_metadata_mal_catalog.db (797 MAL-only entries via Tenrai/Jikan)"]
         DB_FL["anime_metadata_filler_ranges.db (164 shows / 1,278 ranges)"]
     end
 
@@ -231,7 +232,7 @@ sequenceDiagram
     participant Cron as "GitHub Actions (Daily 06:00 UTC / Push)"
     participant GH_Rel as "GitHub Releases (rolling 'latest')"
     participant Harvest as "scripts/harvest_services.py"
-    participant APIs as "14 Active Sources & Live APIs"
+    participant APIs as "15 Active Sources & Live APIs"
     participant Correlate as "scripts/correlate_mappings.py"
     participant Validate as "scripts/validate_mappings.py"
     participant Kodi as "Otaku-RPDev Client (Kodi 21 / 22)"
@@ -240,7 +241,7 @@ sequenceDiagram
     Cron->>Harvest: Run harvest_services.py --data-dir data --cache-dir .cache --seed .seed/anime_mappings.db
     Harvest->>APIs: Fetch active feeds (AniBridge v3, Fribb, ARM, Kometa, Anime-Lists XML, AniDB, MAL-Dubs, Wikidata)
     Harvest->>APIs: Batch-harvest delta AniList GraphQL (250/req) & Kitsu Edge API (20/req + mappings)
-    APIs-->>Harvest: Write 14 standalone data/anime_metadata_<service>_<data>.db files
+    APIs-->>Harvest: Write 15 standalone data/anime_metadata_<service>_<data>.db files
     Cron->>Correlate: Run correlate_mappings.py --data-dir data --seed .seed/anime_mappings.db
     Correlate-->>Cron: Emit dist/anime_mappings.db (.xz), dist/anime_metadata.db, dist/manifest.json, dist/correlation_report.json
     Cron->>Validate: Run validate_mappings.py (PRAGMA integrity_check, EXPLAIN QUERY PLAN, hygiene, monotone coverage, spot checks)
@@ -280,6 +281,7 @@ sequenceDiagram
 | 12 | `anime_metadata_trakt_ids.db` | **Trakt API** (`https://api.trakt.tv`) | Live API & Verified Seed | `trakt_mappings` (**`12,841`** media-kind-scoped Trakt IDs) |
 | 13 | `anime_metadata_filler_ranges.db` | **AnimeFillerList** (`https://www.animefillerlist.com/shows`) | Live Index & Cache | `filler_shows` (**`164`** shows), `filler_ranges` (**`1,278`** mapped filler/recap intervals) |
 | 14 | `anime_metadata_anizip_mappings.db` | **AniZip API** (`https://api.ani.zip/mappings`) | Live API | `anizip_entries` (delta live API mappings) |
+| 15 | `anime_metadata_mal_catalog.db` | **MyAnimeList via Tenrai / Jikan v4** (`https://api.tenrai.org/v1/anime/{id}`) | Live API | `mal_media` (**`797`** MAL-only gap-fill rows: dates, synopsis, rating, trailer, genres, studios) |
 
 ---
 
@@ -361,7 +363,7 @@ Direct download URLs:
 # 1. Run hermetic offline unit tests
 python3 -W default -m unittest discover -s tests -p "test_*.py" -v
 
-# 2. Harvest all 14 active upstream sources into standalone data/anime_metadata_<service>_<data>.db files
+# 2. Harvest all 15 active upstream sources into standalone data/anime_metadata_<service>_<data>.db files
 python3 scripts/harvest_services.py \
   --data-dir data \
   --cache-dir .cache \
@@ -369,7 +371,7 @@ python3 scripts/harvest_services.py \
   --max-anilist-batches 200 \
   --max-kitsu-batches 200
 
-# 3. Correlate all 14 per-service databases into dist/anime_mappings.db, dist/anime_metadata.db & dist/correlation_report.json
+# 3. Correlate all 15 per-service databases into dist/anime_mappings.db, dist/anime_metadata.db & dist/correlation_report.json
 python3 scripts/correlate_mappings.py \
   --data-dir data \
   --seed .seed/anime_mappings_original.db \
@@ -386,3 +388,24 @@ python3 scripts/validate_mappings.py \
   --min-rows 30000 \
   --require-canonical-spots
 ```
+
+---
+
+## 6. Tier-3 Schemas, Coverage & Harvester Flags (v2.8)
+
+**`dist/anime_mappings.db`**: `anime`, `tvdb_rules` (incl. `anibridge_v3_tmdb` fallback), `anime_aliases`, `franchise_links`, `schedule_ids` (`syobocal_tid`, `annict_id`, `livechart_id`, `anisearch_id`, `anime_planet_id`, `animenewsnetwork_id`, `animecountdown_id`), `filler_ranges`, `anime_fts`, `build_meta`.
+
+**`dist/anime_metadata.db`**: `anime_metadata` (24 columns incl. `title_native`, `end_date`, `synopsis`, `age_rating`, `banner_image`, `trailer_yt_id`, `country_of_origin`, `dub_status`, `provenance_json`), `external_ids` (18 service IDs), `anime_aliases`, `franchise_links`, `filler_ranges`, `metadata_fts` (FTS5), `build_meta`.
+
+| Metric (32,315 rows) | Count |
+|---|---:|
+| `year` | 31,291 |
+| `title_native` | 26,004 |
+| `end_date` | 24,705 |
+| `synopsis` | 20,003 |
+| `age_rating` | 19,186 |
+| `schedule_ids` rows | 27,200 |
+| `tvdb_rules` | 11,738 |
+| Aliases | 102,754 |
+
+Harvester flags: `--max-anizip-items N`, `--max-mal-items N`, `--only-mal`, `--skip-live-filler`, `--only-anilist`, `--only-kitsu`. Run tests with `python3 -W default -m unittest discover -s tests -p "test_*.py" -v` (`pytest` is not installed).

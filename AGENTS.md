@@ -57,10 +57,10 @@
   - Always harvest 100% of each active upstream service or aggregator into its own standalone SQLite database in `data/` via `scripts/harvest_services.py` before performing any cross-source correlation.
   - Preserve raw service schemas, localized titles, external ID mappings, episode range descriptors, and `service_meta` harvest timestamps so cross-service disagreements can be audited without re-querying remote APIs.
 - **Tier 2 — Authority-Weighted Cross-Service Correlation (`scripts/correlate_mappings.py`)**:
-  - Correlate all 14 per-service databases using `_pick_consensus()` authority weights and emit `dist/correlation_report.json` recording per-service row counts, consensus matches, and resolved conflicts.
+  - Correlate all 15 per-service databases using `_pick_consensus()` authority weights and emit `dist/correlation_report.json` recording per-service row counts, consensus matches, and resolved conflicts.
 - **Tier 3 — Separated Interconnect vs. Metadata Databases (`dist/`)**:
   - `dist/anime_mappings.db` (+ `.xz`): Lean service-interconnect and seasonal/episode routing database consumed by `Otaku-RPDev`. Focus on cross-platform primary IDs, `thetvdb_season`, `thetvdb_part`, `anime_media_type`, `global_media_type`, `anime_media_episodes`, `global_media_episodes`, `tvdb_rules`, `franchise_links`, and `schedule_ids`. Keep volatile metadata minimal.
-  - `dist/anime_metadata.db` (+ `.xz`): Comprehensive correlated metadata database (`anime_metadata` with per-field `provenance_json`, full `anime_aliases`, and `filler_ranges`) for rich metadata consumption alongside `anime_mappings.db`.
+  - `dist/anime_metadata.db` (+ `.xz`): Comprehensive correlated metadata database (`anime_metadata` with per-field `provenance_json`, `title_native`, `end_date`, `synopsis`, `age_rating`, `banner_image`, `trailer_yt_id`, `dub_status`, `external_ids`, `metadata_fts` FTS5, full `anime_aliases`, and `filler_ranges`) for rich metadata consumption alongside `anime_mappings.db`.
 - **Git Binary Exclusion Invariant**: Never commit binary SQLite databases or cache blobs (`data/`, `dist/`, `.cache/`, `.seed/`, `*.db`, `*.xz`) into Git history. Publish built artifacts exclusively via GitHub Releases (`latest` and dated `vYYYY.MM.DD` tags).
 
 ## 4. Full Historical & Current Catalog Completeness
@@ -85,3 +85,8 @@
   2. `python3 scripts/validate_mappings.py --db dist/anime_mappings.db --baseline .seed/anime_mappings_original.db --xz dist/anime_mappings.db.xz --manifest dist/manifest.json --min-rows 30000 --require-canonical-spots`
 - **Index & Query-Plan Invariant**: Every hot lookup column (`mal_id`, `anilist_id`, `kitsu_id`, `anidb_id`, `simkl_id`, `thetvdb_id`, `themoviedb_id`, `imdb_id`, `trakt_id`, `mal_dub_id`, `mal_title LIKE 'Prefix%'`, seasonal composite browse, TVDB sibling ordering, `anime_fts`, `anime_aliases`, `franchise_links`, `filler_ranges`) must resolve via an index `SEARCH` with zero full-table `SCAN` or `TEMP B-TREE` sort in `EXPLAIN QUERY PLAN`, followed by `ANALYZE` and `VACUUM` for read-only URI (`file:...db?mode=ro`) consumers.
 - **Git Commit Invariant**: All automated Git commits must specify `--no-gpg-sign` (`git commit --no-gpg-sign -m "..."`).
+- **No Collected-but-Dropped Columns**: Every Tier-1 column carrying an external ID or user-visible metadata must be consumed into `dist/anime_mappings.db` or `dist/anime_metadata.db`; assert non-zero coverage in `correlation_report.json`.
+- **Placeholder-Count Sync**: When altering a Tier-1 `CREATE TABLE`, update the matching `INSERT ... VALUES (?,...)` arity in the same edit and smoke-run the harvester.
+- **Read-Before-Rebuild**: Incremental harvesters (`anizip`, `trakt`, `simkl`, `mal_catalog`, `filler`) load prior rows before `_init_service_db()`, which deletes the file.
+- **MAL Catalog Endpoint Order**: Tenrai (`https://api.tenrai.org/v1/anime/{id}`) first, Jikan v4 fallback (Jikan times out from the dev host); checkpoint every 100 rows.
+- **Test Runner & Workflow**: `pytest` is unavailable; use `python3 -W default -m unittest discover -s tests -p "test_*.py" -v`. Publish with `gh workflow run update-mappings.yml -R RPDevs-Builds/Otaku-Mapping-DB --ref main`.
