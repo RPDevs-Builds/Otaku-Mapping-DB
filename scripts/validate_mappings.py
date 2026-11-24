@@ -392,9 +392,42 @@ def validate_database(
     return errors
 
 
+def validate_metadata_database(meta_db_path, min_rows=30000):
+    errors = []
+    if not os.path.isfile(meta_db_path):
+        return [f"Missing metadata DB: {meta_db_path}"]
+    conn = sqlite3.connect(f"file:{meta_db_path}?mode=ro", uri=True)
+    try:
+        ic = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if ic != "ok":
+            errors.append(f"metadata DB integrity_check={ic}")
+        cnt = conn.execute("SELECT COUNT(*) FROM anime_metadata").fetchone()[0]
+        if cnt < min_rows:
+            errors.append(f"metadata DB row_count {cnt} < min_rows {min_rows}")
+        syn_cnt = conn.execute("SELECT COUNT(*) FROM anime_metadata WHERE synopsis IS NOT NULL AND synopsis != ''").fetchone()[0]
+        nat_cnt = conn.execute("SELECT COUNT(*) FROM anime_metadata WHERE title_native IS NOT NULL AND title_native != ''").fetchone()[0]
+        coo_cnt = conn.execute("SELECT COUNT(*) FROM anime_metadata WHERE country_of_origin IS NOT NULL AND country_of_origin != ''").fetchone()[0]
+        bad_dates = conn.execute("SELECT COUNT(*) FROM anime_metadata WHERE end_date IS NOT NULL AND start_date IS NOT NULL AND end_date < start_date").fetchone()[0]
+        ext_cnt = conn.execute("SELECT COUNT(*) FROM external_ids").fetchone()[0]
+        if syn_cnt < 18000:
+            errors.append(f"metadata DB synopsis coverage too low: {syn_cnt}")
+        if nat_cnt < 24000:
+            errors.append(f"metadata DB title_native coverage too low: {nat_cnt}")
+        if coo_cnt <= 0:
+            errors.append(f"metadata DB country_of_origin coverage is 0")
+        if bad_dates > 0:
+            errors.append(f"metadata DB has {bad_dates} rows with end_date < start_date")
+        if ext_cnt != cnt:
+            errors.append(f"metadata DB external_ids count {ext_cnt} != anime_metadata {cnt}")
+    finally:
+        conn.close()
+    return errors
+
+
 def main():
     parser = argparse.ArgumentParser(description="Validate generated anime_mappings.db")
     parser.add_argument("--db", default="dist/anime_mappings.db", help="Candidate SQLite DB")
+    parser.add_argument("--metadata-db", default="", help="Optional correlated anime_metadata.db to verify")
     parser.add_argument("--baseline", default="", help="Optional baseline DB for monotone coverage gate")
     parser.add_argument("--xz", default="", help="Optional compressed .xz archive to verify")
     parser.add_argument("--manifest", default="", help="Optional manifest.json to verify")
@@ -410,6 +443,8 @@ def main():
         min_rows=args.min_rows,
         require_canonical_spots=args.require_canonical_spots,
     )
+    if args.metadata_db:
+        errs.extend(validate_metadata_database(args.metadata_db, min_rows=args.min_rows))
     if errs:
         for e in errs:
             print(f"[FAIL] {e}", file=sys.stderr)

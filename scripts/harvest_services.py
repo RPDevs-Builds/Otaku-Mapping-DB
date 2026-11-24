@@ -946,6 +946,8 @@ def _is_complete_anilist_payload(d):
         return False
     if "genres" not in d or "studios" not in d or "startDate" not in d:
         return False
+    if "description" not in d or "countryOfOrigin" not in d or "trailer" not in d:
+        return False
     sd = d.get("startDate")
     if isinstance(sd, dict) and sd.get("year") is not None and "month" not in sd:
         return False

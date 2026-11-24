@@ -651,6 +651,8 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         # Rich Metadata for dist/anime_metadata.db (100% consumption of Tier-1 columns)
         t_native = al_rec.get("title_native") or ml_rec.get("title_japanese") or kt_rec.get("title_ja") or adb_t.get("official_ja")
         end_date = al_rec.get("end_date") or ml_rec.get("end_date") or kt_rec.get("end_date")
+        if end_date and rec.get("start_date") and end_date < rec["start_date"]:
+            end_date = None
         synopsis = al_rec.get("synopsis") or ml_rec.get("synopsis") or kt_rec.get("synopsis")
         age_rating = ml_rec.get("age_rating") or kt_rec.get("age_rating")
         banner_image = al_rec.get("banner_image") or kt_rec.get("banner_image")
