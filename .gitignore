@@ -1,5 +1,6 @@
 # Build artifacts & persistent CI hydration cache
 dist/
+data/
 .cache/
 .seed/
 __pycache__/

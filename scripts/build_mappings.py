@@ -1333,6 +1333,16 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
   }
 }"""
 
+    def _is_complete_al_cache(d):
+        if not isinstance(d, dict) or not d.get("id"):
+            return False
+        if "genres" not in d or "studios" not in d or "startDate" not in d:
+            return False
+        sd = d.get("startDate")
+        if isinstance(sd, dict) and sd.get("year") is not None and "month" not in sd:
+            return False
+        return True
+
     to_fetch = []
     for mid in candidates:
         ttl = 86400 if records[mid].get("status") in ("ONGOING", "UPCOMING", None) else 14 * 86400
@@ -1342,6 +1352,8 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
                 records, [cached], ep_counts, prequel_edges,
                 franchise_links=franchise_links, aliases_map=aliases_map,
             )
+            if isinstance(cached, dict) and cached and not _is_complete_al_cache(cached):
+                to_fetch.append(mid)
         else:
             to_fetch.append(mid)
 
@@ -1371,8 +1383,13 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
             print(f"[WARN] AniList batch skipped: {exc}", file=sys.stderr)
             break
 
-    # Secondary pass: query direct AniList `id_in` for untitled records that carry anilist_id (unlinked idMal)
-    by_anilist = {r["anilist_id"]: mid for mid, r in records.items() if r.get("anilist_id") and not r.get("mal_title")}
+    # Secondary pass: apply all cached AniList `id_in` entries and query missing/incomplete ones
+    by_anilist = {
+        r["anilist_id"]: mid
+        for mid, r in records.items()
+        if r.get("anilist_id")
+        and (not r.get("mal_title") or not r.get("start_date") or not r.get("genres"))
+    }
     to_fetch_al = []
     for al_id, mid in sorted(by_anilist.items()):
         cached = cache.get("anilist_by_id", al_id, max_age_seconds=30 * 86400)
@@ -1383,6 +1400,8 @@ def hydrate_anilist_relations(records, cache: ApiCache, ep_counts, offline_dir=N
                 records, [patched], ep_counts, prequel_edges,
                 franchise_links=franchise_links, aliases_map=aliases_map,
             )
+            if not _is_complete_al_cache(cached):
+                to_fetch_al.append((al_id, mid))
         elif cached is None:
             to_fetch_al.append((al_id, mid))
 
@@ -2130,17 +2149,14 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
     priority_ids = [
         mid for mid, r in records.items()
         if (
-            r.get("anime_media_type") in ("TV", "ONA", "MOVIE")
+            r.get("anime_media_type") in ("TV", "ONA", "MOVIE", "OVA")
             and (
                 (
-                    (
-                        not r.get("thetvdb_id")
-                        or not r.get("themoviedb_id")
-                        or not r.get("imdb_id")
-                        or not r.get("simkl_id")
-                        or r.get("status") in ("ONGOING", "UPCOMING")
-                    )
-                    and (mid >= 55000 or r.get("status") in ("ONGOING", "UPCOMING"))
+                    not r.get("thetvdb_id")
+                    or not r.get("themoviedb_id")
+                    or not r.get("imdb_id")
+                    or not r.get("simkl_id")
+                    or r.get("status") in ("ONGOING", "UPCOMING")
                 )
                 or (
                     r.get("anime_media_type") in ("TV", "ONA")
@@ -2149,7 +2165,6 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
                         or (
                             r.get("thetvdb_id")
                             and tvdb_counts.get(r["thetvdb_id"], 0) >= 2
-                            and (mid >= 30000 or r.get("thetvdb_season") is None)
                         )
                     )
                 )
@@ -2169,7 +2184,7 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
         need_az_check = (
             not rec.get("thetvdb_id") or not rec.get("themoviedb_id") or not rec.get("imdb_id")
             or rec.get("status") in ("ONGOING", "UPCOMING")
-        ) and (mid >= 55000 or rec.get("status") in ("ONGOING", "UPCOMING"))
+        )
         need_az = {} if not need_az_check else cache.get("anizip", mid, max_age_seconds=ttl)
         if isinstance(need_az, dict) and need_az:
             _apply_anizip(records, mid, need_az, ep_counts)
@@ -2190,12 +2205,12 @@ def hydrate_anizip_and_malsync(records, cache: ApiCache, ep_counts, offline_dir=
 
         need_simkl_check = (
             bool(SIMKL_CLIENT_ID)
-            and (mid >= 55000 or rec.get("status") in ("ONGOING", "UPCOMING"))
             and (
                 not rec.get("thetvdb_id")
                 or not rec.get("themoviedb_id")
                 or not rec.get("imdb_id")
                 or not rec.get("simkl_id")
+                or rec.get("status") in ("ONGOING", "UPCOMING")
             )
         )
         need_sk = {} if not need_simkl_check else cache.get("simkl", mid, max_age_seconds=ttl)
@@ -2786,7 +2801,7 @@ def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None
         for amid, (_p, en_t) in best_en.items():
             records[amid]["title_english"] = en_t
 
-    # Ensure integer episodes column is consistently populated from ep_counts or anime_media_episodes
+    # Ensure integer episodes column and deterministic global_media_type are populated
     for mid, rec in records.items():
         if not rec.get("episodes"):
             eps = parse_pos_int((ep_counts or {}).get(mid))
@@ -2796,6 +2811,14 @@ def finalize_parts_and_uniqueness(records, seed_ids=None, canonical_mal_ids=None
                     eps = rng[1] if rng[0] == 1 else max(1, rng[1] - rng[0] + 1)
             if eps:
                 rec["episodes"] = eps
+        if not rec.get("global_media_type"):
+            am_type = rec.get("anime_media_type") or "TV"
+            if am_type == "MOVIE":
+                rec["global_media_type"] = "movie"
+            elif am_type in ("OVA", "SPECIAL", "MUSIC") and rec.get("themoviedb_id") and not rec.get("thetvdb_id") and (rec.get("episodes") or 1) == 1:
+                rec["global_media_type"] = "movie"
+            else:
+                rec["global_media_type"] = "show"
 
     # Prune empty orphan rows and untitled stale synthetic (>64000 non-Manami) seed shells
     _ = seed_ids  # retained for explicit caller diagnostics

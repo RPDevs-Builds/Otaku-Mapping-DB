@@ -79,25 +79,25 @@ jobs:
             echo "No prior seed DB found; building cleanly from upstream datasets."
           fi
 
-      - name: Build Enriched anime_mappings.db & .xz Archive
+      - name: Harvest Active Per-Service Databases & Correlate anime_mappings.db
         env:
           TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
         run: |
-          SEED_FLAG=""
-          if [ -f .seed/anime_mappings.db ]; then
-            SEED_FLAG="--seed .seed/anime_mappings.db"
+          SEED_FLAG="--seed .seed/anime_mappings.db"
+          if [ ! -f .seed/anime_mappings.db ]; then
+            SEED_FLAG=""
           fi
-          BUDGET="${{ github.event.inputs.api_budget_seconds || '240' }}"
-          ITEMS="${{ github.event.inputs.max_api_items || '600' }}"
-          python3 scripts/build_mappings.py \
-            $SEED_FLAG \
-            --output dist/anime_mappings.db \
-            --compress-xz \
-            --manifest dist/manifest.json \
-            --release-notes dist/RELEASE_NOTES.md \
+          python3 scripts/harvest_services.py \
+            --data-dir data \
             --cache-dir .cache \
-            --api-budget-seconds "$BUDGET" \
-            --max-api-items "$ITEMS"
+            $SEED_FLAG \
+            --max-anilist-batches 15
+          python3 scripts/correlate_mappings.py \
+            --data-dir data \
+            $SEED_FLAG \
+            --output-mappings dist/anime_mappings.db \
+            --output-metadata dist/anime_metadata.db \
+            --report dist/correlation_report.json
 
       - name: Validate Database Integrity, Indexes & Monotone Coverage
         run: |

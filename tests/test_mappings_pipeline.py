@@ -15,6 +15,8 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import build_mappings  # noqa: E402
+import correlate_mappings  # noqa: E402
+import harvest_services  # noqa: E402
 import validate_mappings  # noqa: E402
 
 
@@ -773,6 +775,30 @@ class TestMappingsPipeline(unittest.TestCase):
             fr, matched = build_mappings._map_afl_shows_to_ranges(shows, records, {}, {}, {62001: 12})
             self.assertEqual(matched, 1)
             self.assertEqual(fr, [(62001, 2, 3, "Filler")])
+
+    def test_v27_anibridge_v3_consensus_and_canonical_tvdb_rules(self):
+        # Verify AniBridge v3 range parser and multi-source consensus correlation
+        self.assertEqual(harvest_services._parse_ep_range_spec("9-30"), [(9, 30)])
+        self.assertEqual(harvest_services._parse_ep_range_spec("1156-"), [(1156, None)])
+        self.assertEqual(harvest_services._parse_ep_range_spec("1"), [(1, 1)])
+
+        val, src, conflict = correlate_mappings._pick_consensus([
+            ("anibridge_v3", 5.0, 424536),
+            ("animelists_xml", 4.5, 424536),
+            ("seed", 1.5, 999999),
+        ])
+        self.assertEqual(val, 424536)
+        self.assertEqual(src, "anibridge_v3")
+        self.assertTrue(conflict)
+
+        # Verify _is_complete_anilist_payload rejects old v2.2 cache payloads lacking startDate.month/genres/studios
+        self.assertFalse(harvest_services._is_complete_anilist_payload({"id": 101, "startDate": {"year": 2020}}))
+        self.assertTrue(harvest_services._is_complete_anilist_payload({
+            "id": 101,
+            "genres": ["Action"],
+            "studios": {"nodes": []},
+            "startDate": {"year": 2020, "month": 4, "day": 1},
+        }))
 
 
 if __name__ == "__main__":
