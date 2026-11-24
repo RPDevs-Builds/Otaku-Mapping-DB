@@ -798,6 +798,9 @@ class TestMappingsPipeline(unittest.TestCase):
             "genres": ["Action"],
             "studios": {"nodes": []},
             "startDate": {"year": 2020, "month": 4, "day": 1},
+            "description": "Test synopsis",
+            "countryOfOrigin": "JP",
+            "trailer": None,
         }))
 
 
