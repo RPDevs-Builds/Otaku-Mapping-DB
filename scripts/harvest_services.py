@@ -485,6 +485,91 @@ def _parse_ep_range_spec(spec_str):
     return out
 
 
+def _summarize_anibridge_targets(targets, source_key_id, source_provider_label):
+    """Extract normalized IDs, season/part, and TVDB rule tuples from an AniBridge v3 target map."""
+    mal_id = None
+    anilist_id = None
+    anidb_r_id = None
+    anidb_s_id = None
+    tvdb_show_candidates = []  # (season==0, ep_start, season, show_id, r_start, r_end)
+    tvdb_movie_id = None
+    tmdb_show_candidates = []
+    tmdb_movie_id = None
+    imdb_movie_id = None
+    rules = []
+
+    for tgt_desc, ranges_dict in targets.items():
+        if not isinstance(ranges_dict, dict):
+            continue
+        t_prov, t_id, t_scope = _parse_anibridge_descriptor(tgt_desc)
+        if t_prov == "mal" and not mal_id:
+            mal_id = bm.parse_pos_int(t_id)
+        elif t_prov == "anilist" and not anilist_id:
+            anilist_id = bm.parse_pos_int(t_id)
+        elif t_prov == "anidb":
+            aid = bm.parse_pos_int(t_id)
+            if aid:
+                if t_scope == "R" and not anidb_r_id:
+                    anidb_r_id = aid
+                elif not anidb_s_id:
+                    anidb_s_id = aid
+        elif t_prov == "tvdb_movie" and not tvdb_movie_id:
+            tvdb_movie_id = bm.parse_pos_int(t_id)
+        elif t_prov == "tmdb_movie" and not tmdb_movie_id:
+            tmdb_movie_id = bm.parse_pos_int(t_id)
+        elif t_prov == "imdb_movie" and not imdb_movie_id:
+            imdb_movie_id = bm.clean_imdb_id(t_id)
+        elif t_prov in ("tvdb_show", "tmdb_show"):
+            show_id = bm.parse_pos_int(t_id)
+            season_num = parse_int(t_scope[1:]) if t_scope and t_scope.startswith("s") else None
+            if not show_id or season_num is None or season_num < 0:
+                continue
+            part_idx = 0
+            for s_rng_str, t_rng_str in ranges_dict.items():
+                s_ranges = _parse_ep_range_spec(s_rng_str)
+                t_ranges = _parse_ep_range_spec(t_rng_str)
+                if not s_ranges or not t_ranges:
+                    continue
+                ep_start = s_ranges[0][0]
+                r_start, r_end = t_ranges[0]
+                part_idx += 1
+                if t_prov == "tvdb_show":
+                    tvdb_show_candidates.append((1 if season_num == 0 else 0, ep_start, season_num, show_id, r_start, r_end))
+                    rules.append((source_key_id, show_id, season_num, part_idx, "explicit", r_start, r_end, ep_start, source_provider_label))
+                else:
+                    tmdb_show_candidates.append((1 if season_num == 0 else 0, ep_start, season_num, show_id, r_start, r_end))
+
+    tvdb_show_id = None
+    tvdb_season = None
+    tvdb_part = None
+    if tvdb_show_candidates:
+        tvdb_show_candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+        _, _, tvdb_season, tvdb_show_id, r_start0, _ = tvdb_show_candidates[0]
+        tvdb_part = 2 if (r_start0 and r_start0 > 1) else 1
+
+    tmdb_show_id = None
+    tmdb_season = None
+    if tmdb_show_candidates:
+        tmdb_show_candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+        _, _, tmdb_season, tmdb_show_id, _, _ = tmdb_show_candidates[0]
+
+    summary = (
+        source_key_id,
+        mal_id if source_provider_label != "anibridge_v3_tvdb" else anilist_id,
+        anidb_r_id or anidb_s_id,
+        "R" if anidb_r_id else ("S" if anidb_s_id else None),
+        tvdb_show_id,
+        tvdb_season,
+        tvdb_part,
+        tvdb_movie_id,
+        tmdb_show_id,
+        tmdb_season,
+        tmdb_movie_id,
+        imdb_movie_id,
+    )
+    return summary, rules
+
+
 def harvest_anibridge_v3(data_dir, cache_dir):
     """Harvest 100% of anibridge/anibridge-mappings v3 into anime_metadata_anibridge_mappings.db."""
     raw = bm.load_source_blob("anibridge_v3", ACTIVE_SOURCE_URLS["anibridge_v3"], cache_dir, max_cache_age=3600)
@@ -511,23 +596,21 @@ def harvest_anibridge_v3(data_dir, cache_dir):
         )
         """
     )
+    _summary_cols = (
+        "anilist_id INTEGER, anidb_id INTEGER, anidb_scope TEXT, "
+        "tvdb_show_id INTEGER, tvdb_season INTEGER, tvdb_part INTEGER, tvdb_movie_id INTEGER, "
+        "tmdb_show_id INTEGER, tmdb_season INTEGER, tmdb_movie_id INTEGER, imdb_movie_id TEXT"
+    )
+    conn.execute(f"CREATE TABLE anibridge_mal_summary (mal_id INTEGER PRIMARY KEY, {_summary_cols})")
     conn.execute(
-        """
-        CREATE TABLE anibridge_mal_summary (
-            mal_id INTEGER PRIMARY KEY,
-            anilist_id INTEGER,
-            anidb_id INTEGER,
-            anidb_scope TEXT,
-            tvdb_show_id INTEGER,
-            tvdb_season INTEGER,
-            tvdb_part INTEGER,
-            tvdb_movie_id INTEGER,
-            tmdb_show_id INTEGER,
-            tmdb_season INTEGER,
-            tmdb_movie_id INTEGER,
-            imdb_movie_id TEXT
-        )
-        """
+        "CREATE TABLE anibridge_anilist_summary (anilist_id INTEGER PRIMARY KEY, mal_id INTEGER, "
+        "anidb_id INTEGER, anidb_scope TEXT, tvdb_show_id INTEGER, tvdb_season INTEGER, tvdb_part INTEGER, "
+        "tvdb_movie_id INTEGER, tmdb_show_id INTEGER, tmdb_season INTEGER, tmdb_movie_id INTEGER, imdb_movie_id TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE anibridge_anidb_summary (anidb_id INTEGER PRIMARY KEY, mal_id INTEGER, "
+        "anidb_unused INTEGER, anidb_scope TEXT, tvdb_show_id INTEGER, tvdb_season INTEGER, tvdb_part INTEGER, "
+        "tvdb_movie_id INTEGER, tmdb_show_id INTEGER, tmdb_season INTEGER, tmdb_movie_id INTEGER, imdb_movie_id TEXT)"
     )
     conn.execute(
         """
@@ -544,10 +627,28 @@ def harvest_anibridge_v3(data_dir, cache_dir):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE anibridge_secondary_tvdb_rules (
+            source_id INTEGER NOT NULL,
+            tvdb_id INTEGER NOT NULL,
+            season INTEGER NOT NULL,
+            part INTEGER NOT NULL,
+            rule_type TEXT NOT NULL,
+            range_start INTEGER NOT NULL,
+            range_end INTEGER,
+            ep_start INTEGER NOT NULL,
+            source_provider TEXT NOT NULL
+        )
+        """
+    )
 
     edge_rows = []
     mal_summaries = {}
+    anilist_summaries = {}
+    anidb_summaries = {}
     rule_rows = []
+    sec_rule_rows = []
 
     for src_desc, targets in data.items():
         if src_desc.startswith("$") or not isinstance(targets, dict):
@@ -562,103 +663,85 @@ def harvest_anibridge_v3(data_dir, cache_dir):
 
         if s_prov == "mal":
             mid = bm.parse_pos_int(s_id)
-            if not mid:
-                continue
-            anilist_id = None
-            anidb_r_id = None
-            anidb_s_id = None
-            tvdb_show_candidates = []  # (season, ep_start, tvdb_id, r_start, r_end)
-            tvdb_movie_id = None
-            tmdb_show_candidates = []
-            tmdb_movie_id = None
-            imdb_movie_id = None
-
-            for tgt_desc, ranges_dict in targets.items():
-                if not isinstance(ranges_dict, dict):
-                    continue
-                t_prov, t_id, t_scope = _parse_anibridge_descriptor(tgt_desc)
-                if t_prov == "anilist" and not anilist_id:
-                    anilist_id = bm.parse_pos_int(t_id)
-                elif t_prov == "anidb":
-                    aid = bm.parse_pos_int(t_id)
-                    if aid:
-                        if t_scope == "R" and not anidb_r_id:
-                            anidb_r_id = aid
-                        elif not anidb_s_id:
-                            anidb_s_id = aid
-                elif t_prov == "tvdb_movie" and not tvdb_movie_id:
-                    tvdb_movie_id = bm.parse_pos_int(t_id)
-                elif t_prov == "tmdb_movie" and not tmdb_movie_id:
-                    tmdb_movie_id = bm.parse_pos_int(t_id)
-                elif t_prov == "imdb_movie" and not imdb_movie_id:
-                    imdb_movie_id = bm.clean_imdb_id(t_id)
-                elif t_prov in ("tvdb_show", "tmdb_show"):
-                    show_id = bm.parse_pos_int(t_id)
-                    season_num = parse_int(t_scope[1:]) if t_scope and t_scope.startswith("s") else None
-                    if not show_id or season_num is None or season_num < 0:
-                        continue
-                    part_idx = 0
-                    for s_rng_str, t_rng_str in ranges_dict.items():
-                        s_ranges = _parse_ep_range_spec(s_rng_str)
-                        t_ranges = _parse_ep_range_spec(t_rng_str)
-                        if not s_ranges or not t_ranges:
-                            continue
-                        ep_start = s_ranges[0][0]
-                        r_start, r_end = t_ranges[0]
-                        part_idx += 1
-                        if t_prov == "tvdb_show":
-                            tvdb_show_candidates.append((1 if season_num == 0 else 0, ep_start, season_num, show_id, r_start, r_end))
-                            rule_rows.append((mid, show_id, season_num, part_idx, "explicit", r_start, r_end, ep_start, "anibridge_v3_tvdb"))
-                        else:
-                            tmdb_show_candidates.append((1 if season_num == 0 else 0, ep_start, season_num, show_id, r_start, r_end))
-
-            tvdb_show_id = None
-            tvdb_season = None
-            tvdb_part = None
-            if tvdb_show_candidates:
-                tvdb_show_candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-                _, _, tvdb_season, tvdb_show_id, r_start0, _ = tvdb_show_candidates[0]
-                tvdb_part = 2 if (r_start0 and r_start0 > 1) else 1
-
-            tmdb_show_id = None
-            tmdb_season = None
-            if tmdb_show_candidates:
-                tmdb_show_candidates.sort(key=lambda x: (x[0], x[1], x[2]))
-                _, _, tmdb_season, tmdb_show_id, _, _ = tmdb_show_candidates[0]
-
-            mal_summaries[mid] = (
-                mid,
-                anilist_id,
-                anidb_r_id or anidb_s_id,
-                "R" if anidb_r_id else ("S" if anidb_s_id else None),
-                tvdb_show_id,
-                tvdb_season,
-                tvdb_part,
-                tvdb_movie_id,
-                tmdb_show_id,
-                tmdb_season,
-                tmdb_movie_id,
-                imdb_movie_id,
-            )
+            if mid:
+                summ, rls = _summarize_anibridge_targets(targets, mid, "anibridge_v3_tvdb")
+                mal_summaries[mid] = summ
+                rule_rows.extend(rls)
+        elif s_prov == "anilist":
+            alid = bm.parse_pos_int(s_id)
+            if alid:
+                summ, rls = _summarize_anibridge_targets(targets, alid, "anibridge_v3_anilist")
+                anilist_summaries[alid] = summ
+                sec_rule_rows.extend(rls)
+        elif s_prov == "anidb" and s_scope == "R":
+            aid = bm.parse_pos_int(s_id)
+            if aid:
+                summ, rls = _summarize_anibridge_targets(targets, aid, "anibridge_v3_anidb")
+                anidb_summaries[aid] = summ
+                sec_rule_rows.extend(rls)
 
     conn.executemany("INSERT INTO anibridge_edges VALUES (?,?,?,?,?,?,?,?,?,?)", edge_rows)
     conn.executemany("INSERT INTO anibridge_mal_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(mal_summaries.values()))
+    conn.executemany("INSERT INTO anibridge_anilist_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(anilist_summaries.values()))
+    conn.executemany("INSERT INTO anibridge_anidb_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(anidb_summaries.values()))
     conn.executemany("INSERT INTO anibridge_tvdb_rules VALUES (?,?,?,?,?,?,?,?,?)", rule_rows)
+    conn.executemany("INSERT INTO anibridge_secondary_tvdb_rules VALUES (?,?,?,?,?,?,?,?,?)", sec_rule_rows)
     conn.execute("CREATE INDEX idx_anibridge_src ON anibridge_edges(source_provider, source_id)")
     conn.execute("CREATE INDEX idx_anibridge_rules_mal ON anibridge_tvdb_rules(mal_id)")
+    conn.execute("CREATE INDEX idx_anibridge_sec_rules ON anibridge_secondary_tvdb_rules(source_provider, source_id)")
     _finalize_service_db(conn, len(mal_summaries))
     print(
-        f"[OK] anime_metadata_anibridge_mappings.db: {len(mal_summaries):,} MAL summaries, "
-        f"{len(edge_rows):,} descriptor edges, {len(rule_rows):,} TVDB episode rules"
+        f"[OK] anime_metadata_anibridge_mappings.db: {len(mal_summaries):,} MAL / "
+        f"{len(anilist_summaries):,} AniList / {len(anidb_summaries):,} AniDB:R summaries, "
+        f"{len(edge_rows):,} descriptor edges, {len(rule_rows):,} MAL + {len(sec_rule_rows):,} secondary TVDB rules"
     )
     return len(mal_summaries)
 
 
+def _build_wikidata_v2_url():
+    sparql = (
+        "SELECT ?item ?mal ?anilist ?anidb ?kitsu ?syobocal ?annict ?imdb ?tvdb ?tmdbTv ?tmdbMovie ?trakt ?start ?eps ?enLabel WHERE { "
+        "{ ?item wdt:P4086 ?mal . } UNION "
+        "{ ?item wdt:P8729 ?anilist . } UNION "
+        "{ ?item wdt:P5646 ?anidb . } UNION "
+        "{ ?item wdt:P8731 ?kitsu . } "
+        "OPTIONAL { ?item wdt:P4086 ?mal . } "
+        "OPTIONAL { ?item wdt:P8729 ?anilist . } "
+        "OPTIONAL { ?item wdt:P5646 ?anidb . } "
+        "OPTIONAL { ?item wdt:P8731 ?kitsu . } "
+        "OPTIONAL { ?item wdt:P9881 ?syobocal . } "
+        "OPTIONAL { ?item wdt:P10801 ?annict . } "
+        "OPTIONAL { ?item wdt:P345 ?imdb . } "
+        "OPTIONAL { ?item wdt:P4835 ?tvdb . } "
+        "OPTIONAL { ?item wdt:P4983 ?tmdbTv . } "
+        "OPTIONAL { ?item wdt:P4947 ?tmdbMovie . } "
+        "OPTIONAL { ?item wdt:P8013 ?trakt . } "
+        "OPTIONAL { ?item wdt:P577|wdt:P580 ?start . } "
+        "OPTIONAL { ?item wdt:P1113 ?eps . } "
+        "OPTIONAL { ?item rdfs:label ?enLabel . FILTER(LANG(?enLabel) = \"en\") } "
+        "}"
+    )
+    return f"{bm.WIKIDATA_SPARQL_URL}?{urllib.parse.urlencode({'query': sparql, 'format': 'json'})}"
+
+
+def _clean_wikidata_date(raw_val):
+    s = str(raw_val or "").strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1900 <= y <= 2100):
+        return None
+    mo = max(1, min(12, mo))
+    d = max(1, min(31, d))
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
 def harvest_wikidata(data_dir, cache_dir):
-    """Harvest Wikidata SPARQL cross-IDs into anime_metadata_wikidata_ids.db."""
-    url = bm._build_wikidata_url()
+    """Harvest expanded multi-ID Wikidata SPARQL cross-IDs, Trakt slugs, and start dates into anime_metadata_wikidata_ids.db."""
+    url = _build_wikidata_v2_url()
     raw = bm.load_source_blob(
-        "wikidata",
+        "wikidata_v2",
         url,
         cache_dir,
         max_cache_age=24 * 3600,
@@ -668,12 +751,13 @@ def harvest_wikidata(data_dir, cache_dir):
     data = json.loads(raw.decode("utf-8")) if raw else {}
     bindings = (data.get("results") or {}).get("bindings") or []
     db_path = os.path.join(data_dir, "anime_metadata_wikidata_ids.db")
-    conn = _init_service_db(db_path, "Wikidata Live SPARQL", bm.WIKIDATA_SPARQL_URL)
+    conn = _init_service_db(db_path, "Wikidata Live SPARQL v2", bm.WIKIDATA_SPARQL_URL)
     conn.execute(
         """
         CREATE TABLE wikidata_entries (
             entry_idx INTEGER PRIMARY KEY,
-            mal_id INTEGER NOT NULL,
+            wikidata_qid TEXT,
+            mal_id INTEGER,
             anilist_id INTEGER,
             anidb_id INTEGER,
             kitsu_id INTEGER,
@@ -682,7 +766,11 @@ def harvest_wikidata(data_dir, cache_dir):
             thetvdb_id INTEGER,
             tmdb_tv_id INTEGER,
             tmdb_movie_id INTEGER,
-            imdb_id TEXT
+            imdb_id TEXT,
+            trakt_slug TEXT,
+            start_date TEXT,
+            episodes INTEGER,
+            title_en TEXT
         )
         """
     )
@@ -691,27 +779,44 @@ def harvest_wikidata(data_dir, cache_dir):
         if not isinstance(b, dict):
             continue
         mid = bm.parse_pos_int((b.get("mal") or {}).get("value"))
-        if not mid:
+        alid = bm.parse_pos_int((b.get("anilist") or {}).get("value"))
+        aid = bm.parse_pos_int((b.get("anidb") or {}).get("value"))
+        kid = bm.parse_pos_int((b.get("kitsu") or {}).get("value"))
+        if not (mid or alid or aid or kid):
             continue
+        item_uri = str((b.get("item") or {}).get("value") or "")
+        qid = item_uri.rsplit("/", 1)[-1] if "/Q" in item_uri else None
+        trakt_raw = str((b.get("trakt") or {}).get("value") or "").strip() or None
+        sd = _clean_wikidata_date((b.get("start") or {}).get("value"))
+        eps = bm.parse_pos_int((b.get("eps") or {}).get("value"))
+        en_lbl = str((b.get("enLabel") or {}).get("value") or "").strip() or None
         rows.append(
             (
                 idx,
+                qid,
                 mid,
-                bm.parse_pos_int((b.get("anilist") or {}).get("value")),
-                bm.parse_pos_int((b.get("anidb") or {}).get("value")),
-                bm.parse_pos_int((b.get("kitsu") or {}).get("value")),
+                alid,
+                aid,
+                kid,
                 bm.parse_pos_int((b.get("syobocal") or {}).get("value")),
                 bm.parse_pos_int((b.get("annict") or {}).get("value")),
                 bm.parse_pos_int((b.get("tvdb") or {}).get("value")),
                 bm.parse_pos_int((b.get("tmdbTv") or {}).get("value")),
                 bm.parse_pos_int((b.get("tmdbMovie") or {}).get("value")),
                 bm.clean_imdb_id((b.get("imdb") or {}).get("value")),
+                trakt_raw,
+                sd,
+                eps,
+                en_lbl,
             )
         )
-    conn.executemany("INSERT INTO wikidata_entries VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
-    conn.execute("CREATE INDEX idx_wikidata_mal ON wikidata_entries(mal_id)")
+    conn.executemany("INSERT INTO wikidata_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.execute("CREATE INDEX idx_wikidata_mal ON wikidata_entries(mal_id) WHERE mal_id IS NOT NULL")
+    conn.execute("CREATE INDEX idx_wikidata_al ON wikidata_entries(anilist_id) WHERE anilist_id IS NOT NULL")
+    conn.execute("CREATE INDEX idx_wikidata_adb ON wikidata_entries(anidb_id) WHERE anidb_id IS NOT NULL")
+    conn.execute("CREATE INDEX idx_wikidata_kit ON wikidata_entries(kitsu_id) WHERE kitsu_id IS NOT NULL")
     _finalize_service_db(conn, len(rows))
-    print(f"[OK] anime_metadata_wikidata_ids.db: {len(rows):,} SPARQL bindings")
+    print(f"[OK] anime_metadata_wikidata_ids.db: {len(rows):,} multi-ID SPARQL bindings")
     return len(rows)
 
 

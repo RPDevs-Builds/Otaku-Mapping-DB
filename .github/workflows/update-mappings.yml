@@ -116,8 +116,8 @@ jobs:
       - name: Generate Checksums
         run: |
           cd dist
-          sha256sum anime_mappings.db anime_mappings.db.xz manifest.json > SHA256SUMS.txt
-          md5sum anime_mappings.db anime_mappings.db.xz manifest.json > MD5SUMS.txt
+          sha256sum anime_mappings.db anime_mappings.db.xz anime_metadata.db.xz manifest.json correlation_report.json > SHA256SUMS.txt
+          md5sum anime_mappings.db anime_mappings.db.xz anime_metadata.db.xz manifest.json correlation_report.json > MD5SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish Rolling 'latest' & Dated Snapshot GitHub Releases
@@ -129,15 +129,15 @@ jobs:
 
           # Update rolling 'latest' release cleanly
           if gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload latest dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --clobber -R "${{ github.repository }}"
+            gh release upload latest dist/anime_mappings.db dist/anime_mappings.db.xz dist/anime_metadata.db.xz dist/manifest.json dist/correlation_report.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --clobber -R "${{ github.repository }}"
             gh release edit latest --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
           else
-            gh release create latest dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --title "Otaku Mapping DB (Latest Automated Build)" --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
+            gh release create latest dist/anime_mappings.db dist/anime_mappings.db.xz dist/anime_metadata.db.xz dist/manifest.json dist/correlation_report.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --title "Otaku Mapping DB (Latest Automated Build)" --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
           fi
 
           # Publish/update dated immutable snapshot tag
           if gh release view "$DATE_TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$DATE_TAG" dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --clobber -R "${{ github.repository }}"
+            gh release upload "$DATE_TAG" dist/anime_mappings.db dist/anime_mappings.db.xz dist/anime_metadata.db.xz dist/manifest.json dist/correlation_report.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --clobber -R "${{ github.repository }}"
           else
-            gh release create "$DATE_TAG" dist/anime_mappings.db dist/anime_mappings.db.xz dist/manifest.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --title "Otaku Mapping DB $DATE_TAG" --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
+            gh release create "$DATE_TAG" dist/anime_mappings.db dist/anime_mappings.db.xz dist/anime_metadata.db.xz dist/manifest.json dist/correlation_report.json dist/SHA256SUMS.txt dist/MD5SUMS.txt --title "Otaku Mapping DB $DATE_TAG" --notes-file dist/RELEASE_NOTES.md -R "${{ github.repository }}"
           fi

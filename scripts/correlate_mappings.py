@@ -78,8 +78,14 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     kometa_by_mal_multi = collections.defaultdict(list)
     kometa_by_anidb = {}
     anibridge_by_mal = {}
+    anibridge_by_anilist = {}
+    anibridge_by_anidb = {}
     anibridge_rules = []
+    anibridge_sec_rules = collections.defaultdict(list)
     wikidata_by_mal = {}
+    wikidata_by_anilist = {}
+    wikidata_by_anidb = {}
+    wikidata_by_kitsu = {}
     dubs_set = set()
     trakt_by_mal = {}
     anizip_by_mal = {}
@@ -151,17 +157,35 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     p = os.path.join(data_dir, "anime_metadata_anibridge_mappings.db")
     if os.path.isfile(p):
         c = _ro_conn(p)
-        cur = c.execute("SELECT * FROM anibridge_mal_summary")
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
-        service_counts["anibridge_v3"] = len(rows)
-        for r in rows:
-            d = dict(zip(cols, r))
-            anibridge_by_mal[d["mal_id"]] = d
+        for tbl, target_dict, key_col in (
+            ("anibridge_mal_summary", anibridge_by_mal, "mal_id"),
+            ("anibridge_anilist_summary", anibridge_by_anilist, "anilist_id"),
+            ("anibridge_anidb_summary", anibridge_by_anidb, "anidb_id"),
+        ):
+            try:
+                cur = c.execute(f"SELECT * FROM {tbl}")
+                cols = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+                if tbl == "anibridge_mal_summary":
+                    service_counts["anibridge_v3"] = len(rows)
+                for r in rows:
+                    d = dict(zip(cols, r))
+                    if d.get(key_col):
+                        target_dict[d[key_col]] = d
+            except sqlite3.OperationalError:
+                pass
         cur2 = c.execute("SELECT * FROM anibridge_tvdb_rules")
         rcols = [d[0] for d in cur2.description]
         for r in cur2.fetchall():
             anibridge_rules.append(dict(zip(rcols, r)))
+        try:
+            cur3 = c.execute("SELECT * FROM anibridge_secondary_tvdb_rules")
+            scols = [d[0] for d in cur3.description]
+            for r in cur3.fetchall():
+                sd = dict(zip(scols, r))
+                anibridge_sec_rules[(sd["source_provider"], sd["source_id"])].append(sd)
+        except sqlite3.OperationalError:
+            pass
         c.close()
 
     # Load Wikidata
@@ -174,11 +198,18 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         service_counts["wikidata"] = len(rows)
         for r in rows:
             d = dict(zip(cols, r))
-            mid = d["mal_id"]
-            prev = wikidata_by_mal.setdefault(mid, {})
-            for k, v in d.items():
-                if v is not None and not prev.get(k):
-                    prev[k] = v
+            for key_col, tgt_dict in (
+                ("mal_id", wikidata_by_mal),
+                ("anilist_id", wikidata_by_anilist),
+                ("anidb_id", wikidata_by_anidb),
+                ("kitsu_id", wikidata_by_kitsu),
+            ):
+                kval = d.get(key_col)
+                if kval:
+                    prev = tgt_dict.setdefault(kval, {})
+                    for k, v in d.items():
+                        if v is not None and not prev.get(k):
+                            prev[k] = v
         c.close()
 
     # Load MAL-Dubs
@@ -422,11 +453,23 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         a_rec = arm_by_mal.get(mid) or {}
         k_rec = kometa_by_mal_1to1.get(mid) or {}
         k_multi = (kometa_by_mal_multi.get(mid) or [None])[0] or {}
-        ab_rec = anibridge_by_mal.get(mid) or {}
-        w_rec = wikidata_by_mal.get(mid) or {}
         al_id = rec.get("anilist_id")
-        al_rec = (anilist_by_alid.get(al_id) if al_id else None) or anilist_by_mal.get(mid) or {}
+        aid = rec.get("anidb_id")
         kit_id = rec.get("kitsu_id")
+        ab_rec = (
+            anibridge_by_mal.get(mid)
+            or (anibridge_by_anilist.get(al_id) if al_id else None)
+            or (anibridge_by_anidb.get(aid) if aid else None)
+            or {}
+        )
+        w_rec = (
+            wikidata_by_mal.get(mid)
+            or (wikidata_by_anilist.get(al_id) if al_id else None)
+            or (wikidata_by_anidb.get(aid) if aid else None)
+            or (wikidata_by_kitsu.get(kit_id) if kit_id else None)
+            or {}
+        )
+        al_rec = (anilist_by_alid.get(al_id) if al_id else None) or anilist_by_mal.get(mid) or {}
         kt_rec = (kitsu_by_kid.get(kit_id) if kit_id else None) or kitsu_by_mal.get(mid) or {}
         az_rec = anizip_by_mal.get(mid) or {}
         sm_rec = simkl_by_mal.get(mid) or {}
@@ -463,6 +506,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             ("kitsu_api", 4.0, kt_rec.get("episodes")),
             ("anizip", 3.5, az_rec.get("episode_count")),
             ("simkl", 3.0, sm_api.get("total_episodes")),
+            ("wikidata", 2.5, w_rec.get("episodes")),
             ("seed", 2.0, s_rec.get("episodes")),
         ])
         if eps and eps > 0:
@@ -515,10 +559,20 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         if al_rec.get("start_date"):
             rec["start_date"] = al_rec["start_date"]
+            provenance[mid]["start_date"] = "anilist_graphql"
         elif kt_rec.get("start_date"):
             rec["start_date"] = kt_rec["start_date"]
+            provenance[mid]["start_date"] = "kitsu_api"
+        elif w_rec.get("start_date"):
+            rec["start_date"] = w_rec["start_date"]
+            provenance[mid]["start_date"] = "wikidata"
         elif s_rec.get("start_date"):
             rec["start_date"] = s_rec["start_date"]
+            provenance[mid]["start_date"] = "seed"
+        elif rec.get("year") and 1900 <= int(rec["year"]) <= 2100:
+            s_month = {"WINTER": 1, "SPRING": 4, "SUMMER": 7, "FALL": 10}.get(str(rec.get("anime_season") or "").upper(), 1)
+            rec["start_date"] = f"{int(rec['year']):04d}-{s_month:02d}-01"
+            provenance[mid]["start_date"] = "year_season_derived"
 
         if al_rec.get("genres_csv"):
             rec["genres"] = al_rec["genres_csv"]
@@ -555,6 +609,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             ("anidb_official_en", 4.5, adb_t.get("official_en")),
             ("kitsu_en", 4.0, kt_rec.get("title_en")),
             ("simkl_en", 3.5, sm_api.get("title_en")),
+            ("wikidata_en", 3.0, w_rec.get("title_en")),
             ("seed_en", 2.0, s_rec.get("title_english")),
         ])
         if title_en:
@@ -655,6 +710,19 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
                 rec["trakt_slug"] = tr_rec["trakt_slug"]
         elif kt_rec.get("trakt_id") and not rec.get("trakt_id"):
             rec["trakt_id"] = kt_rec["trakt_id"]
+
+        if not rec.get("trakt_slug") and w_rec.get("trakt_slug"):
+            w_tslug = str(w_rec["trakt_slug"]).strip()
+            expected_pfx = "movies/" if is_movie else "shows/"
+            if w_tslug.startswith(expected_pfx):
+                rec["trakt_slug"] = w_tslug[len(expected_pfx):].strip("/")
+                provenance[mid]["trakt_slug"] = "wikidata_p8013"
+            elif "/" not in w_tslug and w_tslug:
+                rec["trakt_slug"] = w_tslug
+                provenance[mid]["trakt_slug"] = "wikidata_p8013"
+        if not rec.get("trakt_slug") and rec.get("trakt_id") and kt_rec.get("trakt_id") == rec.get("trakt_id") and kt_rec.get("slug"):
+            rec["trakt_slug"] = str(kt_rec["slug"]).strip()
+            provenance[mid]["trakt_slug"] = "kitsu_slug"
 
         def _s_int(v):
             if v is None or isinstance(v, bool):
@@ -786,10 +854,12 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
     # 4. Canonical tvdb_rules Unification (AniBridge v3 + Anime-Lists XML)
     all_rules = []
+    ab_rule_mids = set()
     for rl in anibridge_rules:
         mid = rl["mal_id"]
         if mid not in records:
             continue
+        ab_rule_mids.add(mid)
         all_rules.append({
             "mal_id": mid,
             "tvdb_id": rl["tvdb_id"],
@@ -802,6 +872,30 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             "absolute_start": None,
             "source": "anibridge_v3",
         })
+
+    for mid, rec in records.items():
+        if mid in ab_rule_mids:
+            continue
+        sec_rls = []
+        if rec.get("anilist_id") and ("anibridge_v3_anilist", rec["anilist_id"]) in anibridge_sec_rules:
+            sec_rls = anibridge_sec_rules[("anibridge_v3_anilist", rec["anilist_id"])]
+        elif rec.get("anidb_id") and ("anibridge_v3_anidb", rec["anidb_id"]) in anibridge_sec_rules:
+            sec_rls = anibridge_sec_rules[("anibridge_v3_anidb", rec["anidb_id"])]
+        for rl in sec_rls:
+            if rec.get("thetvdb_id") and rl["tvdb_id"] != rec["thetvdb_id"]:
+                continue
+            all_rules.append({
+                "mal_id": mid,
+                "tvdb_id": rl["tvdb_id"],
+                "season": rl["season"],
+                "part": rl["part"],
+                "rule_type": rl["rule_type"],
+                "range_start": rl["range_start"],
+                "range_end": rl["range_end"],
+                "ep_start": rl["ep_start"],
+                "absolute_start": None,
+                "source": "anibridge_v3",
+            })
 
     # Add Anime-Lists XML rules in canonical (ep_start = local MAL start, range_start = target TVDB start) coordinates
     for mid, rec in records.items():
@@ -974,6 +1068,23 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             "size_bytes": xz_size,
             "sha256": xz_sha,
         }
+    if output_metadata_path and os.path.isfile(output_metadata_path):
+        meta_raw_size = os.path.getsize(output_metadata_path)
+        meta_raw_sha = bm.sha256_file(output_metadata_path)
+        manifest["files"]["metadata_raw"] = {
+            "filename": os.path.basename(output_metadata_path),
+            "size_bytes": meta_raw_size,
+            "sha256": meta_raw_sha,
+        }
+        if compress_xz:
+            meta_xz_path = f"{output_metadata_path}.xz"
+            with open(output_metadata_path, "rb") as src, lzma.open(meta_xz_path, "wb", preset=6) as dst:
+                shutil.copyfileobj(src, dst, 65536)
+            manifest["files"]["metadata_xz"] = {
+                "filename": os.path.basename(meta_xz_path),
+                "size_bytes": os.path.getsize(meta_xz_path),
+                "sha256": bm.sha256_file(meta_xz_path),
+            }
 
     out_dir = os.path.dirname(os.path.abspath(output_mappings_path))
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as mf:
