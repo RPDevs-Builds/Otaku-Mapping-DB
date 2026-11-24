@@ -87,6 +87,8 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     anilist_by_mal = {}
     anilist_by_alid = {}
     anilist_relations = []
+    kitsu_by_mal = {}
+    kitsu_by_kid = {}
     anidb_titles_by_aid = {}
     animelists_by_aid = {}
     animelists_mappings_by_aid = collections.defaultdict(list)
@@ -242,19 +244,34 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     p = os.path.join(data_dir, "anime_metadata_anilist_catalog.db")
     if os.path.isfile(p):
         c = _ro_conn(p)
-        cur = c.execute("SELECT * FROM anilist_media")
+        cur = c.execute("SELECT * FROM anilist_media ORDER BY anilist_id ASC")
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
         service_counts["anilist_catalog"] = len(rows)
         for r in rows:
             d = dict(zip(cols, r))
             anilist_by_alid[d["anilist_id"]] = d
-            if d.get("mal_id"):
+            if d.get("mal_id") and d["mal_id"] not in anilist_by_mal:
                 anilist_by_mal[d["mal_id"]] = d
         cur2 = c.execute("SELECT * FROM anilist_relations")
         rcols = [d[0] for d in cur2.description]
         for r in cur2.fetchall():
             anilist_relations.append(dict(zip(rcols, r)))
+        c.close()
+
+    # Load Kitsu Catalog
+    p = os.path.join(data_dir, "anime_metadata_kitsu_catalog.db")
+    if os.path.isfile(p):
+        c = _ro_conn(p)
+        cur = c.execute("SELECT * FROM kitsu_media ORDER BY kitsu_id ASC")
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        service_counts["kitsu_catalog"] = len(rows)
+        for r in rows:
+            d = dict(zip(cols, r))
+            kitsu_by_kid[d["kitsu_id"]] = d
+            if d.get("mal_id") and d["mal_id"] not in kitsu_by_mal:
+                kitsu_by_mal[d["mal_id"]] = d
         c.close()
 
     # 2. Build the complete universe of MAL IDs from active sources + seed
@@ -289,9 +306,28 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         ab_rec = anibridge_by_mal.get(mid) or {}
         w_rec = wikidata_by_mal.get(mid) or {}
         al_rec = anilist_by_mal.get(mid) or {}
+        kt_rec = kitsu_by_mal.get(mid) or {}
         az_rec = anizip_by_mal.get(mid) or {}
         sm_rec = simkl_by_mal.get(mid) or {}
+        sm_api = sm_rec if sm_rec.get("source") == "simkl_api" else {}
         tr_rec = trakt_by_mal.get(mid) or {}
+        tr_api = tr_rec if tr_rec.get("source") == "trakt_api" else {}
+
+        # Correlate kitsu_id first so kt_rec can also bridge by kitsu_id
+        kit_val, kit_src, kit_conf = _pick_consensus([
+            ("fribb", 4.5, f_rec.get("kitsu_id")),
+            ("kitsu_api", 4.0, kt_rec.get("kitsu_id")),
+            ("anizip", 3.5, az_rec.get("kitsu_id")),
+            ("wikidata", 3.0, w_rec.get("kitsu_id")),
+            ("seed", 1.5, s_rec.get("kitsu_id")),
+        ])
+        rec["kitsu_id"] = kit_val
+        if kit_src:
+            provenance[mid]["kitsu_id"] = kit_src
+        if kit_conf:
+            conflict_counters["kitsu_id"] += 1
+        if not kt_rec and kit_val and kit_val in kitsu_by_kid:
+            kt_rec = kitsu_by_kid[kit_val]
 
         # Correlate anilist_id
         al_val, al_src, al_conf = _pick_consensus([
@@ -300,6 +336,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             ("arm", 3.5, a_rec.get("anilist_id")),
             ("fribb", 3.5, f_rec.get("anilist_id")),
             ("kometa", 3.0, k_rec.get("anilist_id")),
+            ("kitsu_mappings", 2.5, kt_rec.get("anilist_id")),
             ("wikidata", 2.5, w_rec.get("anilist_id")),
             ("anizip", 2.5, az_rec.get("anilist_id")),
             ("seed", 1.0, s_rec.get("anilist_id")),
@@ -310,8 +347,8 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         if al_conf:
             conflict_counters["anilist_id"] += 1
 
-        # If anilist_by_mal didn't match directly (idMal was null on AniList), link via correlated anilist_id!
-        if not al_rec and al_val and al_val in anilist_by_alid:
+        # Select the exact AniList record corresponding to the winning anilist_id
+        if al_val and al_val in anilist_by_alid:
             al_rec = anilist_by_alid[al_val]
 
         # Correlate anidb_id (strictly 1-to-1 Regular scope preferred over Special scope)
@@ -321,8 +358,9 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             ("anibridge_v3_R", 4.0, ab_anidb_r),
             ("kometa_1to1", 3.5, k_rec.get("anidb_id")),
             ("anizip", 3.0, az_rec.get("anidb_id")),
+            ("kitsu_mappings", 2.5, kt_rec.get("anidb_id")),
             ("wikidata", 2.5, w_rec.get("anidb_id")),
-            ("simkl", 2.0, sm_rec.get("anidb_id")),
+            ("simkl_api", 2.0, sm_api.get("anidb_id")),
             ("seed", 1.5, s_rec.get("anidb_id")),
         ])
         if aid_val and aid_val not in claimed_anidb:
@@ -333,19 +371,6 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             rec["anidb_id"] = None
         if aid_conf:
             conflict_counters["anidb_id"] += 1
-
-        # Correlate kitsu_id
-        kit_val, kit_src, kit_conf = _pick_consensus([
-            ("fribb", 4.5, f_rec.get("kitsu_id")),
-            ("anizip", 3.5, az_rec.get("kitsu_id")),
-            ("wikidata", 3.0, w_rec.get("kitsu_id")),
-            ("seed", 1.5, s_rec.get("kitsu_id")),
-        ])
-        rec["kitsu_id"] = kit_val
-        if kit_src:
-            provenance[mid]["kitsu_id"] = kit_src
-        if kit_conf:
-            conflict_counters["kitsu_id"] += 1
 
         # Correlate simkl_id
         sim_val, sim_src, sim_conf = _pick_consensus([
@@ -400,10 +425,14 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         ab_rec = anibridge_by_mal.get(mid) or {}
         w_rec = wikidata_by_mal.get(mid) or {}
         al_id = rec.get("anilist_id")
-        al_rec = anilist_by_mal.get(mid) or (anilist_by_alid.get(al_id) if al_id else None) or {}
+        al_rec = (anilist_by_alid.get(al_id) if al_id else None) or anilist_by_mal.get(mid) or {}
+        kit_id = rec.get("kitsu_id")
+        kt_rec = (kitsu_by_kid.get(kit_id) if kit_id else None) or kitsu_by_mal.get(mid) or {}
         az_rec = anizip_by_mal.get(mid) or {}
         sm_rec = simkl_by_mal.get(mid) or {}
+        sm_api = sm_rec if sm_rec.get("source") == "simkl_api" else {}
         tr_rec = trakt_by_mal.get(mid) or {}
+        tr_api = tr_rec if tr_rec.get("source") == "trakt_api" else {}
         aid = rec.get("anidb_id")
         xl_rec = animelists_by_aid.get(aid) if aid else {}
         if not xl_rec:
@@ -421,8 +450,9 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         # Media Type
         mtype, mtype_src, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("format")),
+            ("kitsu_api", 4.0, kt_rec.get("subtype")),
             ("fribb", 3.5, f_rec.get("media_type")),
-            ("simkl", 3.0, sm_rec.get("media_type")),
+            ("simkl", 3.0, sm_api.get("media_type")),
             ("seed", 2.0, s_rec.get("anime_media_type")),
         ])
         rec["anime_media_type"] = mtype or rec.get("anime_media_type") or "TV"
@@ -430,8 +460,9 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         # Episodes, Status, Duration, Year, Season, Start Date, Genres, Studios, Picture
         eps, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("episodes")),
+            ("kitsu_api", 4.0, kt_rec.get("episodes")),
             ("anizip", 3.5, az_rec.get("episode_count")),
-            ("simkl", 3.0, sm_rec.get("total_episodes")),
+            ("simkl", 3.0, sm_api.get("total_episodes")),
             ("seed", 2.0, s_rec.get("episodes")),
         ])
         if eps and eps > 0:
@@ -451,6 +482,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         status_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("status")),
+            ("kitsu_api", 4.0, kt_rec.get("status")),
             ("seed", 2.0, s_rec.get("status")),
         ])
         if status_val:
@@ -458,6 +490,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         dur_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("duration_seconds")),
+            ("kitsu_api", 4.0, kt_rec.get("duration_seconds")),
             ("seed", 2.0, s_rec.get("duration")),
         ])
         if dur_val:
@@ -465,7 +498,8 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         year_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("year")),
-            ("simkl", 3.0, sm_rec.get("year")),
+            ("kitsu_api", 4.0, kt_rec.get("year")),
+            ("simkl", 3.0, sm_api.get("year")),
             ("seed", 2.0, s_rec.get("year")),
         ])
         if year_val:
@@ -473,6 +507,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         season_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("season")),
+            ("kitsu_api", 4.0, kt_rec.get("anime_season")),
             ("seed", 2.0, s_rec.get("anime_season")),
         ])
         if season_val:
@@ -480,30 +515,37 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         if al_rec.get("start_date"):
             rec["start_date"] = al_rec["start_date"]
+        elif kt_rec.get("start_date"):
+            rec["start_date"] = kt_rec["start_date"]
         elif s_rec.get("start_date"):
             rec["start_date"] = s_rec["start_date"]
 
         if al_rec.get("genres_csv"):
             rec["genres"] = al_rec["genres_csv"]
-        elif sm_rec.get("genres_csv"):
-            rec["genres"] = sm_rec["genres_csv"]
+        elif sm_api.get("genres_csv"):
+            rec["genres"] = sm_api["genres_csv"]
 
         if al_rec.get("studios_csv"):
             rec["studios"] = al_rec["studios_csv"]
-        elif sm_rec.get("studios_csv"):
-            rec["studios"] = sm_rec["studios_csv"]
+        elif sm_api.get("studios_csv"):
+            rec["studios"] = sm_api["studios_csv"]
 
-        if not rec.get("mal_picture") and (al_rec.get("cover_image_large") or al_rec.get("cover_image_medium")):
-            rec["mal_picture"] = al_rec.get("cover_image_large") or al_rec.get("cover_image_medium")
+        if not rec.get("mal_picture"):
+            rec["mal_picture"] = (
+                al_rec.get("cover_image_large")
+                or al_rec.get("cover_image_medium")
+                or kt_rec.get("poster_image")
+            )
 
         # Titles & English Title
         title_main, _, _ = _pick_consensus([
             ("seed", 4.5, s_rec.get("mal_title") if s_rec.get("mal_title") and not str(s_rec.get("mal_title")).startswith("Anime #") else None),
             ("anilist_romaji", 4.0, al_rec.get("title_romaji")),
+            ("kitsu_romaji", 3.8, kt_rec.get("title_romaji") or kt_rec.get("canonical_title")),
             ("anidb_main", 3.5, adb_t.get("main_title")),
             ("animelists_name", 3.0, xl_rec.get("name")),
             ("anilist_pref", 2.5, al_rec.get("title_user_preferred")),
-            ("anilist_en", 2.0, al_rec.get("title_english")),
+            ("anilist_en", 2.0, al_rec.get("title_english") or kt_rec.get("title_en")),
         ])
         if title_main:
             rec["mal_title"] = title_main
@@ -511,14 +553,15 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         title_en, en_src, _ = _pick_consensus([
             ("anilist_en", 5.0, al_rec.get("title_english")),
             ("anidb_official_en", 4.5, adb_t.get("official_en")),
-            ("simkl_en", 3.5, sm_rec.get("title_en")),
+            ("kitsu_en", 4.0, kt_rec.get("title_en")),
+            ("simkl_en", 3.5, sm_api.get("title_en")),
             ("seed_en", 2.0, s_rec.get("title_english")),
         ])
         if title_en:
             rec["title_english"] = title_en
             provenance[mid]["title_english"] = en_src
 
-        # Populate aliases_map from AniList, AniDB, Anime-Lists XML, and canonical titles
+        # Populate aliases_map from AniList, Kitsu, AniDB, Anime-Lists XML, and canonical titles
         if rec.get("mal_title"):
             bm._add_alias(aliases_map, mid, rec["mal_title"], "canonical")
         if rec.get("title_english"):
@@ -528,6 +571,12 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
                 bm._add_alias(aliases_map, mid, al_rec[t_field], t_type)
         if al_rec.get("synonyms_json"):
             for syn in json.loads(al_rec["synonyms_json"]):
+                bm._add_alias(aliases_map, mid, syn, "synonym")
+        for t_field, t_type in [("title_en", "english"), ("title_romaji", "romaji"), ("canonical_title", "synonym")]:
+            if kt_rec.get(t_field):
+                bm._add_alias(aliases_map, mid, kt_rec[t_field], t_type)
+        if kt_rec.get("abbreviated_titles_json"):
+            for syn in json.loads(kt_rec["abbreviated_titles_json"]):
                 bm._add_alias(aliases_map, mid, syn, "synonym")
         if adb_t.get("main_title"):
             bm._add_alias(aliases_map, mid, adb_t["main_title"], "romaji")
@@ -550,9 +599,10 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
                 ("kometa", 4.0, k_rec.get("thetvdb_id") or k_multi.get("thetvdb_id")),
                 ("fribb", 3.5, f_rec.get("thetvdb_id")),
                 ("anizip", 3.0, az_rec.get("thetvdb_id")),
+                ("kitsu_mappings", 2.5, kt_rec.get("thetvdb_id")),
                 ("wikidata", 2.5, w_rec.get("thetvdb_id")),
-                ("simkl", 2.0, sm_rec.get("thetvdb_id")),
-                ("trakt", 2.0, tr_rec.get("thetvdb_id")),
+                ("simkl_api", 2.0, sm_api.get("thetvdb_id")),
+                ("trakt_api", 2.0, tr_api.get("thetvdb_id")),
                 ("seed", 1.5, s_rec.get("thetvdb_id")),
             ])
             rec["thetvdb_id"] = tvdb_val
@@ -570,8 +620,8 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             ("fribb", 4.0, f_rec.get("themoviedb_id")),
             ("wikidata", 3.5, w_tmdb),
             ("anizip", 3.0, az_rec.get("themoviedb_id")),
-            ("simkl", 2.5, sm_rec.get("themoviedb_id")),
-            ("trakt", 2.0, tr_rec.get("themoviedb_id")),
+            ("simkl_api", 2.5, sm_api.get("themoviedb_id")),
+            ("trakt_api", 2.0, tr_api.get("themoviedb_id")),
             ("seed", 1.5, s_rec.get("themoviedb_id")),
         ])
         rec["themoviedb_id"] = tmdb_val
@@ -588,8 +638,8 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             ("fribb", 3.5, f_rec.get("imdb_id")),
             ("wikidata", 3.5, w_rec.get("imdb_id")),
             ("anizip", 3.0, az_rec.get("imdb_id")),
-            ("simkl", 2.5, sm_rec.get("imdb_id")),
-            ("trakt", 2.0, tr_rec.get("imdb_id")),
+            ("simkl_api", 2.5, sm_api.get("imdb_id")),
+            ("trakt_api", 2.0, tr_api.get("imdb_id")),
             ("seed", 1.5, s_rec.get("imdb_id")),
         ])
         rec["imdb_id"] = imdb_val
@@ -603,6 +653,8 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             rec["trakt_id"] = tr_rec["trakt_id"]
             if tr_rec.get("trakt_slug"):
                 rec["trakt_slug"] = tr_rec["trakt_slug"]
+        elif kt_rec.get("trakt_id") and not rec.get("trakt_id"):
+            rec["trakt_id"] = kt_rec["trakt_id"]
 
         def _s_int(v):
             if v is None or isinstance(v, bool):
@@ -612,31 +664,43 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             s = str(v).strip()
             return int(s) if s.isdigit() else None
 
-        # Correlate thetvdb_season & episode offset
-        if xl_rec.get("default_tvdb_season_raw") == "a":
+        def _tvdb_match(src_tvdb):
+            w_tvdb = rec.get("thetvdb_id")
+            if not w_tvdb or not src_tvdb:
+                return True
+            return int(src_tvdb) == int(w_tvdb)
+
+        # Correlate thetvdb_season & episode offset (strictly coupled to sources matching winning thetvdb_id)
+        if xl_rec.get("default_tvdb_season_raw") == "a" and _tvdb_match(xl_rec.get("thetvdb_id")):
             rec["thetvdb_season"] = "a"
             provenance[mid]["thetvdb_season"] = "animelists_tvdb_absolute"
         else:
+            k_tvdb_id = k_rec.get("thetvdb_id") or k_multi.get("thetvdb_id")
+            k_season = k_rec.get("tvdb_season") if k_rec.get("tvdb_season") is not None else k_multi.get("tvdb_season")
             season_num, season_src, _ = _pick_consensus([
-                ("anibridge_v3_tvdb", 5.0, _s_int(ab_rec.get("tvdb_season"))),
-                ("animelists_tvdb", 4.5, _s_int(xl_rec.get("default_tvdb_season"))),
-                ("kometa_tvdb", 4.0, _s_int(k_rec.get("tvdb_season") if k_rec.get("tvdb_season") is not None else k_multi.get("tvdb_season"))),
-                ("fribb_tvdb", 3.5, _s_int(f_rec.get("season_tvdb"))),
-                ("anibridge_v3_tmdb", 3.0, _s_int(ab_rec.get("tmdb_season"))),
+                ("anibridge_v3_tvdb", 5.0, _s_int(ab_rec.get("tvdb_season")) if _tvdb_match(ab_rec.get("tvdb_show_id")) else None),
+                ("animelists_tvdb", 4.5, _s_int(xl_rec.get("default_tvdb_season")) if _tvdb_match(xl_rec.get("thetvdb_id")) else None),
+                ("kometa_tvdb", 4.0, _s_int(k_season) if _tvdb_match(k_tvdb_id) else None),
+                ("fribb_tvdb", 3.5, _s_int(f_rec.get("season_tvdb")) if _tvdb_match(f_rec.get("thetvdb_id")) else None),
+                ("kitsu_tvdb", 3.0, _s_int(kt_rec.get("thetvdb_season")) if _tvdb_match(kt_rec.get("thetvdb_id")) else None),
+                ("anibridge_v3_tmdb", 2.8, _s_int(ab_rec.get("tmdb_season"))),
                 ("animelists_tmdb", 2.5, _s_int(xl_rec.get("tmdb_season"))),
                 ("fribb_tmdb", 2.0, _s_int(f_rec.get("season_tmdb"))),
-                ("seed", 1.5, _s_int(s_rec.get("thetvdb_season"))),
+                ("seed", 1.5, _s_int(s_rec.get("thetvdb_season")) if _tvdb_match(s_rec.get("thetvdb_id")) else None),
             ])
             if season_num is not None and season_num >= 0:
                 rec["thetvdb_season"] = season_num
                 provenance[mid]["thetvdb_season"] = season_src
 
-        # Apply positive episode offset to global_media_episodes
-        k_off = k_rec.get("tvdb_epoffset") or k_multi.get("tvdb_epoffset") or 0
+        # Apply positive episode offset to global_media_episodes (coupled to winning thetvdb_id)
+        k_tvdb_id = k_rec.get("thetvdb_id") or k_multi.get("thetvdb_id")
+        k_off = (k_rec.get("tvdb_epoffset") or k_multi.get("tvdb_epoffset") or 0) if _tvdb_match(k_tvdb_id) else 0
+        xl_off = (xl_rec.get("episode_offset") or 0) if _tvdb_match(xl_rec.get("thetvdb_id")) else 0
+        f_off = (f_rec.get("episode_offset") or 0) if _tvdb_match(f_rec.get("thetvdb_id")) else 0
         ep_off = (
-            (xl_rec.get("episode_offset") if xl_rec.get("episode_offset") and xl_rec["episode_offset"] > 0 else None)
+            (xl_off if xl_off > 0 else None)
             or (k_off if k_off > 0 else None)
-            or (f_rec.get("episode_offset") if f_rec.get("episode_offset") and f_rec["episode_offset"] > 0 else None)
+            or (f_off if f_off > 0 else None)
             or (xl_rec.get("tmdb_offset") if xl_rec.get("tmdb_offset") and xl_rec["tmdb_offset"] > 0 else None)
             or 0
         )

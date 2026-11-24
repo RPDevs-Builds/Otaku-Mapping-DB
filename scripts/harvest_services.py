@@ -885,6 +885,7 @@ def harvest_anilist_catalog(data_dir, cache_dir, seed_db_path, max_http_batches=
         ("anime_metadata_anibridge_mappings.db", "SELECT mal_id, anilist_id FROM anibridge_mal_summary"),
         ("anime_metadata_kometa_ids.db", "SELECT mal_id_single, anilist_id FROM kometa_entries"),
         ("anime_metadata_wikidata_ids.db", "SELECT mal_id, anilist_id FROM wikidata_entries"),
+        ("anime_metadata_kitsu_catalog.db", "SELECT mal_id, anilist_id FROM kitsu_media"),
     ]:
         p = os.path.join(data_dir, svc_db)
         if os.path.isfile(p):
@@ -1184,9 +1185,9 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
                 tid,
                 r.get("trakt_slug"),
                 r.get("global_media_type"),
-                bm.parse_pos_int(r.get("thetvdb_id")),
-                bm.parse_pos_int(r.get("themoviedb_id")),
-                bm.clean_imdb_id(r.get("imdb_id")),
+                None,
+                None,
+                None,
                 "seed",
             )
     for p in glob.glob(os.path.join(cache_dir, "trakt__*.json")):
@@ -1312,18 +1313,18 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
             simkl_map[mid] = (
                 mid,
                 sid,
-                bm.parse_pos_int(r.get("anidb_id")),
-                bm.parse_pos_int(r.get("thetvdb_id")),
-                bm.parse_pos_int(r.get("themoviedb_id")),
-                bm.clean_imdb_id(r.get("imdb_id")),
-                r.get("mal_title"),
-                r.get("title_english"),
-                bm.parse_pos_int(r.get("year")),
-                r.get("anime_media_type"),
-                bm.parse_pos_int(r.get("episodes")),
-                r.get("status"),
-                r.get("genres"),
-                r.get("studios"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 "seed",
             )
     for p in glob.glob(os.path.join(cache_dir, "simkl__*.json")):
@@ -1409,15 +1410,270 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
     print(f"[OK] anime_metadata_filler_ranges.db: {len(show_rows):,} cached AnimeFillerList shows, {len(range_rows):,} mapped filler ranges")
 
 
+KITSU_STATUS_MAP = {
+    "FINISHED": "FINISHED",
+    "CURRENT": "ONGOING",
+    "UPCOMING": "UPCOMING",
+    "TBA": "UPCOMING",
+    "UNRELEASED": "UPCOMING",
+}
+
+
+def _fetch_kitsu_20_batch(kitsu_ids):
+    if not kitsu_ids:
+        return [], {}
+    ids_csv = ",".join(str(x) for x in kitsu_ids)
+    url = f"https://kitsu.app/api/edge/anime?filter%5Bid%5D={ids_csv}&page%5Blimit%5D=20&include=mappings"
+    for attempt in range(3):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.api+json",
+                "User-Agent": "Otaku-Mapping-DB/2.7 (+https://github.com/RPDevs-Builds/Otaku-Mapping-DB)",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                inc_map = {}
+                for inc in payload.get("included") or []:
+                    if isinstance(inc, dict) and inc.get("type") == "mappings" and inc.get("id"):
+                        inc_map[str(inc["id"])] = inc.get("attributes") or {}
+                return payload.get("data") or [], inc_map
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(5.0 * (attempt + 1))
+                continue
+            break
+        except Exception:
+            time.sleep(1.5)
+    return [], {}
+
+
+def harvest_kitsu_catalog(data_dir, cache_dir, seed_db_path, max_http_batches=200):
+    """Harvest Kitsu API catalog & built-in external mappings into anime_metadata_kitsu_catalog.db."""
+    db_path = os.path.join(data_dir, "anime_metadata_kitsu_catalog.db")
+    mal_by_kitsu = {}
+    priority_kitsu_ids = set()
+    all_kitsu_ids = set()
+
+    for svc_db, sql_q in [
+        ("anime_metadata_fribb_ids.db", "SELECT mal_id, kitsu_id FROM fribb_entries WHERE kitsu_id IS NOT NULL"),
+        ("anime_metadata_wikidata_ids.db", "SELECT mal_id, kitsu_id FROM wikidata_entries WHERE kitsu_id IS NOT NULL"),
+    ]:
+        p = os.path.join(data_dir, svc_db)
+        if os.path.isfile(p):
+            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            for mid, kid in c.execute(sql_q):
+                if kid and kid > 0:
+                    all_kitsu_ids.add(int(kid))
+                    if mid and mid > 0 and int(kid) not in mal_by_kitsu:
+                        mal_by_kitsu[int(kid)] = int(mid)
+            c.close()
+
+    if seed_db_path and os.path.isfile(seed_db_path):
+        c = sqlite3.connect(f"file:{seed_db_path}?mode=ro", uri=True)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(anime)")}
+        sd_col = "start_date" if "start_date" in cols else "NULL"
+        en_col = "title_english" if "title_english" in cols else "NULL"
+        for mid, kid, sd, en, alid in c.execute(f"SELECT mal_id, kitsu_id, {sd_col}, {en_col}, anilist_id FROM anime WHERE kitsu_id IS NOT NULL"):
+            if kid and kid > 0:
+                all_kitsu_ids.add(int(kid))
+                if mid and mid > 0 and int(kid) not in mal_by_kitsu:
+                    mal_by_kitsu[int(kid)] = int(mid)
+                if not sd or not en or not alid:
+                    priority_kitsu_ids.add(int(kid))
+        c.close()
+
+    kitsu_by_id = {}
+    if os.path.isfile(db_path):
+        try:
+            c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            for (raw_json,) in c.execute("SELECT raw_json FROM kitsu_media WHERE raw_json IS NOT NULL"):
+                d = json.loads(raw_json)
+                if isinstance(d, dict) and d.get("kitsu_id"):
+                    kitsu_by_id[int(d["kitsu_id"])] = d
+            c.close()
+        except Exception:
+            pass
+
+    for p in glob.glob(os.path.join(cache_dir, "kitsu__*.json")):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                d = (json.load(f) or {}).get("data")
+            if isinstance(d, dict) and d.get("kitsu_id"):
+                kitsu_by_id[int(d["kitsu_id"])] = d
+        except Exception:
+            pass
+
+    unfetched_priority = sorted(priority_kitsu_ids - set(kitsu_by_id.keys()))
+    unfetched_rest = sorted((all_kitsu_ids - priority_kitsu_ids) - set(kitsu_by_id.keys()))
+    to_fetch = unfetched_priority + unfetched_rest
+    print(
+        f"[Kitsu Catalog] Known kitsu_ids={len(all_kitsu_ids):,}, in_cache={len(kitsu_by_id):,}, "
+        f"priority_unfetched={len(unfetched_priority):,}, rest_unfetched={len(unfetched_rest):,}",
+        flush=True,
+    )
+
+    import concurrent.futures
+    cache = bm.ApiCache(cache_dir)
+    chunks_20 = [to_fetch[i : i + 20] for i in range(0, len(to_fetch), 20)][:max_http_batches]
+    for wave_start in range(0, len(chunks_20), 40):
+        wave = chunks_20[wave_start : wave_start + 40]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(_fetch_kitsu_20_batch, wave))
+        for items, inc_map in results:
+            for item in items:
+                kid = bm.parse_pos_int(item.get("id"))
+                if not kid:
+                    continue
+                attrs = item.get("attributes") or {}
+                rels = ((item.get("relationships") or {}).get("mappings") or {}).get("data") or []
+                ext_mappings = {}
+                for r_obj in rels:
+                    m_id = str((r_obj or {}).get("id") or "")
+                    if m_id in inc_map:
+                        site = inc_map[m_id].get("externalSite")
+                        ext_id = inc_map[m_id].get("externalId")
+                        if site and ext_id:
+                            ext_mappings[site] = ext_id
+                rec_obj = {
+                    "kitsu_id": kid,
+                    "attributes": attrs,
+                    "external_mappings": ext_mappings,
+                }
+                kitsu_by_id[kid] = rec_obj
+                cache.set("kitsu", kid, rec_obj)
+        done = min(wave_start + 40, len(chunks_20))
+        print(f"  [Kitsu batch {done}/{len(chunks_20)}] collected={len(kitsu_by_id):,}", flush=True)
+        if done % 120 == 0:
+            _write_kitsu_catalog_db(db_path, kitsu_by_id, mal_by_kitsu)
+
+    return _write_kitsu_catalog_db(db_path, kitsu_by_id, mal_by_kitsu)
+
+
+def _write_kitsu_catalog_db(db_path, kitsu_by_id, mal_by_kitsu):
+    tmp_path = f"{db_path}.tmp"
+    conn = _init_service_db(tmp_path, "Kitsu Edge API", "https://kitsu.app/api/edge/anime")
+    conn.execute(
+        """
+        CREATE TABLE kitsu_media (
+            kitsu_id INTEGER PRIMARY KEY,
+            mal_id INTEGER,
+            anilist_id INTEGER,
+            anidb_id INTEGER,
+            thetvdb_id INTEGER,
+            thetvdb_season INTEGER,
+            trakt_id INTEGER,
+            slug TEXT,
+            subtype TEXT,
+            status TEXT,
+            episodes INTEGER,
+            duration_seconds INTEGER,
+            start_date TEXT,
+            end_date TEXT,
+            year INTEGER,
+            anime_season TEXT,
+            canonical_title TEXT,
+            title_en TEXT,
+            title_romaji TEXT,
+            title_ja TEXT,
+            abbreviated_titles_json TEXT,
+            poster_image TEXT,
+            age_rating TEXT,
+            raw_json TEXT NOT NULL
+        )
+        """
+    )
+    rows = []
+    for kid, obj in sorted(kitsu_by_id.items()):
+        attrs = obj.get("attributes") or {}
+        ext = obj.get("external_mappings") or {}
+        mid = bm.parse_pos_int(ext.get("myanimelist/anime")) or mal_by_kitsu.get(kid)
+        alid = bm.parse_pos_int(ext.get("anilist/anime"))
+        aid = bm.parse_pos_int(ext.get("anidb"))
+        trakt_id = bm.parse_pos_int(ext.get("trakt"))
+        tvdb_raw = str(ext.get("thetvdb") or ext.get("thetvdb/series") or ext.get("thetvdb/season") or "").strip()
+        tvdb_id = None
+        tvdb_season = None
+        if "/" in tvdb_raw:
+            p0, p1 = tvdb_raw.split("/", 1)
+            tvdb_id = bm.parse_pos_int(p0)
+            tvdb_season = parse_int(p1)
+        else:
+            tvdb_id = bm.parse_pos_int(tvdb_raw)
+
+        subtype = normalize_media_type(attrs.get("subtype"))
+        status = KITSU_STATUS_MAP.get(str(attrs.get("status") or "").upper())
+        eps = bm.parse_pos_int(attrs.get("episodeCount"))
+        ep_len = bm.parse_pos_int(attrs.get("episodeLength"))
+        dur_s = ep_len * 60 if ep_len else None
+        sd = str(attrs.get("startDate") or "").strip()
+        start_date = sd if re.match(r"^\d{4}-\d{2}-\d{2}$", sd) else None
+        ed = str(attrs.get("endDate") or "").strip()
+        end_date = ed if re.match(r"^\d{4}-\d{2}-\d{2}$", ed) else None
+        year = int(start_date[:4]) if start_date and 1900 <= int(start_date[:4]) <= 2100 else None
+        anime_season = None
+        if start_date:
+            m_num = int(start_date[5:7])
+            anime_season = "WINTER" if m_num in (1, 2, 3) else ("SPRING" if m_num in (4, 5, 6) else ("SUMMER" if m_num in (7, 8, 9) else "FALL"))
+        titles = attrs.get("titles") if isinstance(attrs.get("titles"), dict) else {}
+        t_en = (titles.get("en") or titles.get("en_us") or "").strip() or None
+        t_rom = (titles.get("en_jp") or "").strip() or None
+        t_ja = (titles.get("ja_jp") or "").strip() or None
+        c_title = (attrs.get("canonicalTitle") or "").strip() or None
+        abbr = [str(s).strip() for s in (attrs.get("abbreviatedTitles") or []) if isinstance(s, str) and str(s).strip()]
+        poster = attrs.get("posterImage") if isinstance(attrs.get("posterImage"), dict) else {}
+        poster_url = (poster.get("large") or poster.get("original") or poster.get("medium") or "").strip() or None
+
+        rows.append((
+            kid,
+            mid,
+            alid,
+            aid,
+            tvdb_id,
+            tvdb_season,
+            trakt_id,
+            (attrs.get("slug") or "").strip() or None,
+            subtype,
+            status,
+            eps,
+            dur_s,
+            start_date,
+            end_date,
+            year,
+            anime_season,
+            c_title,
+            t_en,
+            t_rom,
+            t_ja,
+            json.dumps(abbr, ensure_ascii=False) if abbr else None,
+            poster_url,
+            (attrs.get("ageRating") or "").strip() or None,
+            json.dumps(obj, ensure_ascii=False),
+        ))
+    conn.executemany("INSERT OR REPLACE INTO kitsu_media VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.execute("CREATE INDEX idx_kitsu_mal ON kitsu_media(mal_id) WHERE mal_id IS NOT NULL")
+    _finalize_service_db(conn, len(rows))
+    os.replace(tmp_path, db_path)
+    print(f"[OK] anime_metadata_kitsu_catalog.db: {len(rows):,} Kitsu records", flush=True)
+    return len(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Harvest active anime sources into data/anime_metadata_<service>_<data>.db")
     parser.add_argument("--data-dir", default="data", help="Output directory for per-service SQLite DBs")
     parser.add_argument("--cache-dir", default=".cache", help="Persistent download & API cache directory")
     parser.add_argument("--seed", default="dist/anime_mappings.db", help="Seed DB for verified historical Trakt/Simkl IDs")
     parser.add_argument("--max-anilist-batches", type=int, default=200, help="Max 250-ID AniList GraphQL batches per run")
+    parser.add_argument("--max-kitsu-batches", type=int, default=180, help="Max 20-ID Kitsu Edge API batches per run")
     parser.add_argument("--only-anilist", action="store_true", help="Only run AniList catalog harvester")
+    parser.add_argument("--only-kitsu", action="store_true", help="Only run Kitsu catalog harvester")
     args = parser.parse_args()
 
+    if args.only_kitsu:
+        harvest_kitsu_catalog(args.data_dir, args.cache_dir, args.seed, max_http_batches=args.max_kitsu_batches)
+        return 0
     if not args.only_anilist:
         harvest_fribb(args.data_dir, args.cache_dir)
         harvest_arm(args.data_dir, args.cache_dir)
@@ -1428,6 +1684,7 @@ def main():
         harvest_mal_dubs(args.data_dir, args.cache_dir)
         harvest_anidb_titles(args.data_dir, args.cache_dir)
         harvest_trakt_anizip_simkl_filler(args.data_dir, args.cache_dir, args.seed)
+        harvest_kitsu_catalog(args.data_dir, args.cache_dir, args.seed, max_http_batches=args.max_kitsu_batches)
     harvest_anilist_catalog(args.data_dir, args.cache_dir, args.seed, max_http_batches=args.max_anilist_batches)
     return 0
 
