@@ -2890,7 +2890,9 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
         )
         conn.execute(
             "CREATE TABLE schedule_ids ("
-            "mal_id INTEGER PRIMARY KEY, syobocal_tid INTEGER, annict_id INTEGER)"
+            "mal_id INTEGER PRIMARY KEY, syobocal_tid INTEGER, annict_id INTEGER, "
+            "livechart_id INTEGER, anisearch_id INTEGER, anime_planet_id TEXT, "
+            "animenewsnetwork_id INTEGER, animecountdown_id INTEGER)"
         )
         conn.execute(
             "CREATE TABLE filler_ranges ("
@@ -2958,14 +2960,23 @@ def write_sqlite_database(output_path, records, rules, stats, aliases_map=None, 
                 link_rows,
             )
 
-        sched_rows = [
-            (mid, syo, ann)
-            for mid, (syo, ann) in sorted((schedule_ids or {}).items())
-            if mid in records and (syo or ann)
-        ]
+        sched_rows = []
+        for mid, val in sorted((schedule_ids or {}).items()):
+            if mid not in records or not val:
+                continue
+            if len(val) == 2:
+                syo, ann = val
+                row_t = (mid, syo, ann, None, None, None, None, None)
+            else:
+                row_t = (mid, val[0], val[1], val[2], val[3], val[4], val[5], val[6])
+            if any(x is not None and x != "" for x in row_t[1:]):
+                sched_rows.append(row_t)
         if sched_rows:
             conn.executemany(
-                "INSERT INTO schedule_ids (mal_id, syobocal_tid, annict_id) VALUES (?, ?, ?)",
+                "INSERT INTO schedule_ids ("
+                "mal_id, syobocal_tid, annict_id, livechart_id, anisearch_id, "
+                "anime_planet_id, animenewsnetwork_id, animecountdown_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 sched_rows,
             )
 

@@ -63,8 +63,9 @@ ANILIST_MEDIA_FIELDS = (
     "id idMal format status episodes duration season seasonYear "
     "startDate { year month day } endDate { year month day } "
     "title { romaji english native userPreferred } synonyms "
-    "genres studios(isMain: true) { nodes { name isAnimationStudio } } "
-    "coverImage { large medium } "
+    "description(asHtml: false) genres studios(isMain: true) { nodes { name isAnimationStudio } } "
+    "coverImage { large medium } bannerImage countryOfOrigin isAdult "
+    "trailer { id site } "
     "relations { edges { relationType node { id idMal type format } } }"
 )
 
@@ -535,9 +536,10 @@ def _summarize_anibridge_targets(targets, source_key_id, source_provider_label):
                 part_idx += 1
                 if t_prov == "tvdb_show":
                     tvdb_show_candidates.append((1 if season_num == 0 else 0, ep_start, season_num, show_id, r_start, r_end))
-                    rules.append((source_key_id, show_id, season_num, part_idx, "explicit", r_start, r_end, ep_start, source_provider_label))
+                    rules.append(("tvdb_show", source_key_id, show_id, season_num, part_idx, "explicit", r_start, r_end, ep_start, source_provider_label))
                 else:
                     tmdb_show_candidates.append((1 if season_num == 0 else 0, ep_start, season_num, show_id, r_start, r_end))
+                    rules.append(("tmdb_show", source_key_id, show_id, season_num, part_idx, "explicit", r_start, r_end, ep_start, source_provider_label))
 
     tvdb_show_id = None
     tvdb_season = None
@@ -643,11 +645,28 @@ def harvest_anibridge_v3(data_dir, cache_dir):
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE anibridge_tmdb_rules (
+            mal_id INTEGER NOT NULL,
+            tmdb_id INTEGER NOT NULL,
+            season INTEGER NOT NULL,
+            part INTEGER NOT NULL,
+            rule_type TEXT NOT NULL,
+            range_start INTEGER NOT NULL,
+            range_end INTEGER,
+            ep_start INTEGER NOT NULL,
+            source_provider TEXT NOT NULL
+        )
+        """
+    )
+
     edge_rows = []
     mal_summaries = {}
     anilist_summaries = {}
     anidb_summaries = {}
     rule_rows = []
+    tmdb_rule_rows = []
     sec_rule_rows = []
 
     for src_desc, targets in data.items():
@@ -666,34 +685,40 @@ def harvest_anibridge_v3(data_dir, cache_dir):
             if mid:
                 summ, rls = _summarize_anibridge_targets(targets, mid, "anibridge_v3_tvdb")
                 mal_summaries[mid] = summ
-                rule_rows.extend(rls)
+                for rl in rls:
+                    if rl[0] == "tvdb_show":
+                        rule_rows.append(rl[1:])
+                    else:
+                        tmdb_rule_rows.append(rl[1:])
         elif s_prov == "anilist":
             alid = bm.parse_pos_int(s_id)
             if alid:
                 summ, rls = _summarize_anibridge_targets(targets, alid, "anibridge_v3_anilist")
                 anilist_summaries[alid] = summ
-                sec_rule_rows.extend(rls)
+                sec_rule_rows.extend(rl[1:] for rl in rls if rl[0] == "tvdb_show")
         elif s_prov == "anidb" and s_scope == "R":
             aid = bm.parse_pos_int(s_id)
             if aid:
                 summ, rls = _summarize_anibridge_targets(targets, aid, "anibridge_v3_anidb")
                 anidb_summaries[aid] = summ
-                sec_rule_rows.extend(rls)
+                sec_rule_rows.extend(rl[1:] for rl in rls if rl[0] == "tvdb_show")
 
     conn.executemany("INSERT INTO anibridge_edges VALUES (?,?,?,?,?,?,?,?,?,?)", edge_rows)
     conn.executemany("INSERT INTO anibridge_mal_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(mal_summaries.values()))
     conn.executemany("INSERT INTO anibridge_anilist_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(anilist_summaries.values()))
     conn.executemany("INSERT INTO anibridge_anidb_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(anidb_summaries.values()))
     conn.executemany("INSERT INTO anibridge_tvdb_rules VALUES (?,?,?,?,?,?,?,?,?)", rule_rows)
+    conn.executemany("INSERT INTO anibridge_tmdb_rules VALUES (?,?,?,?,?,?,?,?,?)", tmdb_rule_rows)
     conn.executemany("INSERT INTO anibridge_secondary_tvdb_rules VALUES (?,?,?,?,?,?,?,?,?)", sec_rule_rows)
     conn.execute("CREATE INDEX idx_anibridge_src ON anibridge_edges(source_provider, source_id)")
     conn.execute("CREATE INDEX idx_anibridge_rules_mal ON anibridge_tvdb_rules(mal_id)")
+    conn.execute("CREATE INDEX idx_anibridge_tmdb_rules_mal ON anibridge_tmdb_rules(mal_id)")
     conn.execute("CREATE INDEX idx_anibridge_sec_rules ON anibridge_secondary_tvdb_rules(source_provider, source_id)")
     _finalize_service_db(conn, len(mal_summaries))
     print(
         f"[OK] anime_metadata_anibridge_mappings.db: {len(mal_summaries):,} MAL / "
         f"{len(anilist_summaries):,} AniList / {len(anidb_summaries):,} AniDB:R summaries, "
-        f"{len(edge_rows):,} descriptor edges, {len(rule_rows):,} MAL + {len(sec_rule_rows):,} secondary TVDB rules"
+        f"{len(edge_rows):,} descriptor edges, {len(rule_rows):,} TVDB + {len(tmdb_rule_rows):,} TMDB + {len(sec_rule_rows):,} secondary rules"
     )
     return len(mal_summaries)
 
@@ -1152,6 +1177,11 @@ def _write_anilist_catalog_db(db_path, media_by_alid, mal_by_anilist):
             studios_csv TEXT,
             cover_image_large TEXT,
             cover_image_medium TEXT,
+            synopsis TEXT,
+            banner_image TEXT,
+            country_of_origin TEXT,
+            is_adult INTEGER,
+            trailer_yt_id TEXT,
             raw_json TEXT NOT NULL
         )
         """
@@ -1209,6 +1239,13 @@ def _write_anilist_catalog_db(db_path, media_by_alid, mal_by_anilist):
             anim_st = [str(n.get("name")).strip() for n in st_nodes if isinstance(n, dict) and n.get("name")]
         studios_csv = ",".join(dict.fromkeys(anim_st)) if anim_st else None
         cov = m.get("coverImage") if isinstance(m.get("coverImage"), dict) else {}
+        desc_raw = str(m.get("description") or "").strip()
+        synopsis = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", desc_raw)).strip() or None
+        banner_img = (m.get("bannerImage") or "").strip() or None
+        country_origin = (m.get("countryOfOrigin") or "").strip().upper() or None
+        is_adult = 1 if m.get("isAdult") is True else (0 if m.get("isAdult") is False else None)
+        tr = m.get("trailer") if isinstance(m.get("trailer"), dict) else {}
+        trailer_yt = (tr.get("id") or "").strip() or None if str(tr.get("site") or "").lower() == "youtube" else None
 
         media_rows.append(
             (
@@ -1232,6 +1269,11 @@ def _write_anilist_catalog_db(db_path, media_by_alid, mal_by_anilist):
                 studios_csv,
                 (cov.get("large") or "").strip() or None,
                 (cov.get("medium") or "").strip() or None,
+                synopsis,
+                banner_img,
+                country_origin,
+                is_adult,
+                trailer_yt,
                 json.dumps(m, ensure_ascii=False),
             )
         )
@@ -1250,7 +1292,7 @@ def _write_anilist_catalog_db(db_path, media_by_alid, mal_by_anilist):
             rel_mid = bm.parse_pos_int(node.get("idMal")) or mal_by_anilist.get(rel_alid)
             rel_rows.append((alid, mid, rel_alid, rel_mid, rtype, normalize_media_type(node.get("format"))))
 
-    conn.executemany("INSERT OR REPLACE INTO anilist_media VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", media_rows)
+    conn.executemany("INSERT OR REPLACE INTO anilist_media VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", media_rows)
     conn.executemany("INSERT OR IGNORE INTO anilist_relations VALUES (?,?,?,?,?,?)", rel_rows)
     conn.execute("CREATE INDEX idx_anilist_mal ON anilist_media(mal_id) WHERE mal_id IS NOT NULL")
     conn.execute("CREATE INDEX idx_anilist_rel_mal ON anilist_relations(mal_id, related_mal_id)")
@@ -1260,35 +1302,91 @@ def _write_anilist_catalog_db(db_path, media_by_alid, mal_by_anilist):
     return len(media_rows)
 
 
-def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
+def _fetch_anizip_single(mal_id):
+    url = f"https://api.ani.zip/mappings?mal_id={int(mal_id)}"
+    for attempt in range(3):
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": "Otaku-Mapping-DB/2.8 (+https://github.com/RPDevs-Builds/Otaku-Mapping-DB)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data if isinstance(data, dict) else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(3.0 * (attempt + 1))
+                continue
+            if e.code == 404:
+                return {}
+            break
+        except Exception:
+            time.sleep(0.5)
+    return None
+
+
+def _anizip_row_from_dict(mid, d):
+    mappings = d.get("mappings") if isinstance(d.get("mappings"), dict) else {}
+    return (
+        mid,
+        bm.parse_pos_int(mappings.get("anidb_id")),
+        bm.parse_pos_int(mappings.get("anilist_id")),
+        bm.parse_pos_int(mappings.get("kitsu_id")),
+        bm.parse_pos_int(mappings.get("thetvdb_id")),
+        bm.parse_pos_int(mappings.get("themoviedb_id")),
+        bm.clean_imdb_id(mappings.get("imdb_id")),
+        bm.parse_pos_int(mappings.get("simkl_id")),
+        bm.parse_pos_int(mappings.get("livechart_id")),
+        str(mappings.get("notifymoe_id") or "").strip() or None,
+        bm.parse_pos_int(d.get("episodeCount")),
+        bm.parse_pos_int(d.get("specialCount")),
+        json.dumps(d.get("titles") or {}, ensure_ascii=False),
+        json.dumps(d, ensure_ascii=False),
+    )
+
+
+def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path, max_anizip_items=600, fetch_live_filler=True):
     """Harvest Trakt, AniZip, Simkl, and AnimeFillerList into their dedicated per-service databases."""
+    import concurrent.futures
+
     seed_rows = bm.load_seed_database(seed_db_path) if (seed_db_path and os.path.isfile(seed_db_path)) else {}
+    cache = bm.ApiCache(cache_dir)
+
+    # Backfill trakt_slug from wikidata + kitsu
+    slug_by_mal = {}
+    for svc_db, sql_q in (
+        ("anime_metadata_wikidata_ids.db", "SELECT mal_id, trakt_slug FROM wikidata_entries WHERE mal_id IS NOT NULL AND trakt_slug IS NOT NULL"),
+        ("anime_metadata_kitsu_catalog.db", "SELECT mal_id, slug FROM kitsu_media WHERE mal_id IS NOT NULL AND trakt_id IS NOT NULL AND slug IS NOT NULL"),
+    ):
+        sp = os.path.join(data_dir, svc_db)
+        if os.path.isfile(sp):
+            try:
+                sc = sqlite3.connect(f"file:{sp}?mode=ro", uri=True)
+                for mid, sl in sc.execute(sql_q):
+                    if mid and sl and int(mid) not in slug_by_mal:
+                        slug_by_mal[int(mid)] = str(sl).strip()
+                sc.close()
+            except Exception:
+                pass
 
     # 1. Trakt IDs DB
     trakt_db = os.path.join(data_dir, "anime_metadata_trakt_ids.db")
-    conn = _init_service_db(trakt_db, "Trakt API & Verified Mappings", "https://api.trakt.tv")
-    conn.execute(
-        """
-        CREATE TABLE trakt_mappings (
-            mal_id INTEGER PRIMARY KEY,
-            trakt_id INTEGER NOT NULL,
-            trakt_slug TEXT,
-            media_type TEXT,
-            thetvdb_id INTEGER,
-            themoviedb_id INTEGER,
-            imdb_id TEXT,
-            source TEXT NOT NULL
-        )
-        """
-    )
     trakt_map = {}
+    if os.path.isfile(trakt_db):
+        try:
+            tc = sqlite3.connect(f"file:{trakt_db}?mode=ro", uri=True)
+            for row in tc.execute("SELECT mal_id, trakt_id, trakt_slug, media_type, thetvdb_id, themoviedb_id, imdb_id, source FROM trakt_mappings"):
+                trakt_map[int(row[0])] = row
+            tc.close()
+        except Exception:
+            pass
     for mid, r in seed_rows.items():
         tid = bm.parse_pos_int(r.get("trakt_id"))
-        if tid:
+        if tid and mid not in trakt_map:
             trakt_map[mid] = (
                 mid,
                 tid,
-                r.get("trakt_slug"),
+                r.get("trakt_slug") or slug_by_mal.get(mid),
                 r.get("global_media_type"),
                 None,
                 None,
@@ -1307,7 +1405,7 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
                 trakt_map[mid] = (
                     mid,
                     d,
-                    prev[2] if prev else None,
+                    (prev[2] if prev else None) or slug_by_mal.get(mid),
                     prev[3] if prev else None,
                     prev[4] if prev else None,
                     prev[5] if prev else None,
@@ -1318,7 +1416,7 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
                 trakt_map[mid] = (
                     mid,
                     bm.parse_pos_int(d.get("trakt_id")),
-                    d.get("trakt_slug"),
+                    d.get("trakt_slug") or slug_by_mal.get(mid),
                     d.get("media_type"),
                     bm.parse_pos_int(d.get("thetvdb_id")),
                     bm.parse_pos_int(d.get("themoviedb_id")),
@@ -1327,12 +1425,75 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
                 )
         except Exception:
             pass
+    for mid, row in list(trakt_map.items()):
+        if not row[2] and mid in slug_by_mal:
+            trakt_map[mid] = (row[0], row[1], slug_by_mal[mid], row[3], row[4], row[5], row[6], row[7])
+
+    conn = _init_service_db(trakt_db, "Trakt API & Verified Mappings", "https://api.trakt.tv")
+    conn.execute(
+        """
+        CREATE TABLE trakt_mappings (
+            mal_id INTEGER PRIMARY KEY,
+            trakt_id INTEGER NOT NULL,
+            trakt_slug TEXT,
+            media_type TEXT,
+            thetvdb_id INTEGER,
+            themoviedb_id INTEGER,
+            imdb_id TEXT,
+            source TEXT NOT NULL
+        )
+        """
+    )
     conn.executemany("INSERT OR REPLACE INTO trakt_mappings VALUES (?,?,?,?,?,?,?,?)", list(trakt_map.values()))
     _finalize_service_db(conn, len(trakt_map))
-    print(f"[OK] anime_metadata_trakt_ids.db: {len(trakt_map):,} Trakt mappings")
+    print(f"[OK] anime_metadata_trakt_ids.db: {len(trakt_map):,} Trakt mappings ({sum(1 for r in trakt_map.values() if r[2]):,} with slug)")
 
-    # 2. AniZip Mappings DB
+    # 2. AniZip Mappings DB (incremental cache + live backfill for unmapped shows)
     anizip_db = os.path.join(data_dir, "anime_metadata_anizip_mappings.db")
+    az_by_mal = {}
+    if os.path.isfile(anizip_db):
+        try:
+            ac = sqlite3.connect(f"file:{anizip_db}?mode=ro", uri=True)
+            for row in ac.execute("SELECT * FROM anizip_entries"):
+                az_by_mal[int(row[0])] = row
+            ac.close()
+        except Exception:
+            pass
+    for p in glob.glob(os.path.join(cache_dir, "anizip__*.json")):
+        try:
+            mid = bm.parse_pos_int(os.path.basename(p).split("__")[1].split(".")[0])
+            with open(p, "r", encoding="utf-8") as f:
+                d = (json.load(f) or {}).get("data")
+            if mid and isinstance(d, dict) and d:
+                az_by_mal[mid] = _anizip_row_from_dict(mid, d)
+        except Exception:
+            pass
+
+    if max_anizip_items > 0:
+        priority_az = []
+        for mid, r in sorted(seed_rows.items()):
+            if mid in az_by_mal:
+                continue
+            if cache.get("anizip", mid, max_age_seconds=30 * 86400) == {}:
+                continue
+            if not r.get("thetvdb_id") or not r.get("themoviedb_id") or not r.get("anidb_id") or not r.get("simkl_id"):
+                priority_az.append(mid)
+        to_fetch_az = priority_az[:max_anizip_items]
+        if to_fetch_az:
+            print(f"[AniZip] Live-harvesting {len(to_fetch_az):,} missing mappings from api.ani.zip...", flush=True)
+            def _az_worker(mid):
+                res = _fetch_anizip_single(mid)
+                if res is not None:
+                    cache.set("anizip", mid, res)
+                return mid, res
+            fetched_cnt = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                for mid, res in pool.map(_az_worker, to_fetch_az):
+                    if isinstance(res, dict) and res:
+                        az_by_mal[mid] = _anizip_row_from_dict(mid, res)
+                        fetched_cnt += 1
+            print(f"[AniZip] Live-harvested {fetched_cnt:,} new records (total {len(az_by_mal):,})", flush=True)
+
     conn = _init_service_db(anizip_db, "AniZip API", "https://api.ani.zip/mappings")
     conn.execute(
         """
@@ -1354,83 +1515,26 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
         )
         """
     )
-    az_rows = []
-    for p in glob.glob(os.path.join(cache_dir, "anizip__*.json")):
-        try:
-            mid = bm.parse_pos_int(os.path.basename(p).split("__")[1].split(".")[0])
-            with open(p, "r", encoding="utf-8") as f:
-                d = (json.load(f) or {}).get("data")
-            if not mid or not isinstance(d, dict) or not d:
-                continue
-            mappings = d.get("mappings") if isinstance(d.get("mappings"), dict) else {}
-            az_rows.append(
-                (
-                    mid,
-                    bm.parse_pos_int(mappings.get("anidb_id")),
-                    bm.parse_pos_int(mappings.get("anilist_id")),
-                    bm.parse_pos_int(mappings.get("kitsu_id")),
-                    bm.parse_pos_int(mappings.get("thetvdb_id")),
-                    bm.parse_pos_int(mappings.get("themoviedb_id")),
-                    bm.clean_imdb_id(mappings.get("imdb_id")),
-                    bm.parse_pos_int(mappings.get("simkl_id")),
-                    bm.parse_pos_int(mappings.get("livechart_id")),
-                    str(mappings.get("notifymoe_id") or "").strip() or None,
-                    bm.parse_pos_int(d.get("episodeCount")),
-                    bm.parse_pos_int(d.get("specialCount")),
-                    json.dumps(d.get("titles") or {}, ensure_ascii=False),
-                    json.dumps(d, ensure_ascii=False),
-                )
-            )
-        except Exception:
-            pass
-    conn.executemany("INSERT OR REPLACE INTO anizip_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", az_rows)
-    _finalize_service_db(conn, len(az_rows))
-    print(f"[OK] anime_metadata_anizip_mappings.db: {len(az_rows):,} cached AniZip records")
+    conn.executemany("INSERT OR REPLACE INTO anizip_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", list(az_by_mal.values()))
+    _finalize_service_db(conn, len(az_by_mal))
+    print(f"[OK] anime_metadata_anizip_mappings.db: {len(az_by_mal):,} AniZip records")
 
     # 3. Simkl Catalog DB
     simkl_db = os.path.join(data_dir, "anime_metadata_simkl_catalog.db")
-    conn = _init_service_db(simkl_db, "Simkl API", "https://api.simkl.com")
-    conn.execute(
-        """
-        CREATE TABLE simkl_entries (
-            mal_id INTEGER PRIMARY KEY,
-            simkl_id INTEGER NOT NULL,
-            anidb_id INTEGER,
-            thetvdb_id INTEGER,
-            themoviedb_id INTEGER,
-            imdb_id TEXT,
-            title TEXT,
-            title_en TEXT,
-            year INTEGER,
-            media_type TEXT,
-            total_episodes INTEGER,
-            status TEXT,
-            genres_csv TEXT,
-            studios_csv TEXT,
-            source TEXT NOT NULL
-        )
-        """
-    )
     simkl_map = {}
+    if os.path.isfile(simkl_db):
+        try:
+            sc = sqlite3.connect(f"file:{simkl_db}?mode=ro", uri=True)
+            for row in sc.execute("SELECT * FROM simkl_entries"):
+                simkl_map[int(row[0])] = row
+            sc.close()
+        except Exception:
+            pass
     for mid, r in seed_rows.items():
         sid = bm.parse_pos_int(r.get("simkl_id"))
-        if sid:
+        if sid and mid not in simkl_map:
             simkl_map[mid] = (
-                mid,
-                sid,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                "seed",
+                mid, sid, None, None, None, None, None, None, None, None, None, None, None, None, "seed",
             )
     for p in glob.glob(os.path.join(cache_dir, "simkl__*.json")):
         try:
@@ -1463,12 +1567,82 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
             )
         except Exception:
             pass
+    conn = _init_service_db(simkl_db, "Simkl API", "https://api.simkl.com")
+    conn.execute(
+        """
+        CREATE TABLE simkl_entries (
+            mal_id INTEGER PRIMARY KEY,
+            simkl_id INTEGER NOT NULL,
+            anidb_id INTEGER,
+            thetvdb_id INTEGER,
+            themoviedb_id INTEGER,
+            imdb_id TEXT,
+            title TEXT,
+            title_en TEXT,
+            year INTEGER,
+            media_type TEXT,
+            total_episodes INTEGER,
+            status TEXT,
+            genres_csv TEXT,
+            studios_csv TEXT,
+            source TEXT NOT NULL
+        )
+        """
+    )
     conn.executemany("INSERT OR REPLACE INTO simkl_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", list(simkl_map.values()))
     _finalize_service_db(conn, len(simkl_map))
     print(f"[OK] anime_metadata_simkl_catalog.db: {len(simkl_map):,} Simkl entries")
 
-    # 4. Filler Ranges DB
+    # 4. Filler Ranges DB (full AnimeFillerList /shows crawl)
+    if fetch_live_filler:
+        slugs = cache.get("afl", "_directory", max_age_seconds=7 * 86400)
+        if not isinstance(slugs, list) or not slugs:
+            try:
+                raw, status, _ = bm._http_get_bytes(bm.SOURCE_URLS["animefillerlist"], timeout=15, retries=1)
+                slugs = bm._parse_afl_directory_html(raw.decode("utf-8", "ignore")) if (status == 200 and raw) else []
+                if slugs:
+                    cache.set("afl", "_directory", slugs)
+            except Exception:
+                slugs = []
+        if isinstance(slugs, list) and slugs:
+            missing_slugs = [
+                slug for slug in slugs
+                if not isinstance(cache.get("afl", f"show_{slug}", max_age_seconds=21 * 86400), dict)
+            ]
+            if missing_slugs:
+                print(f"[AnimeFillerList] Crawling {len(missing_slugs):,} uncached show pages (total index={len(slugs):,})...", flush=True)
+                def _afl_worker(slug):
+                    try:
+                        raw, status, _ = bm._http_get_bytes(f"{bm.SOURCE_URLS['animefillerlist']}/{slug}", timeout=12, retries=1)
+                        if status == 200 and raw:
+                            parsed = bm._parse_afl_show_html(raw.decode("utf-8", "ignore"), slug=slug)
+                            cache.set("afl", f"show_{slug}", parsed)
+                        elif status == 404:
+                            cache.set("afl", f"show_{slug}", {"slug": slug, "title": "", "max_ep": 0, "episodes": {}})
+                    except Exception:
+                        pass
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    list(pool.map(_afl_worker, missing_slugs))
+
     filler_db = os.path.join(data_dir, "anime_metadata_filler_ranges.db")
+    show_rows_map = {}
+    for p in glob.glob(os.path.join(cache_dir, "afl__show_*.json")):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                d = (json.load(f) or {}).get("data")
+            if isinstance(d, dict) and d.get("episodes"):
+                slug = d.get("slug") or os.path.basename(p).split("__show_", 1)[1].rsplit(".", 1)[0]
+                show_rows_map[slug] = (slug, d.get("title"), bm.parse_pos_int(d.get("max_ep")), json.dumps(d.get("episodes"), ensure_ascii=False))
+        except Exception:
+            pass
+    range_rows = []
+    if seed_db_path and os.path.isfile(seed_db_path):
+        try:
+            sc = sqlite3.connect(f"file:{seed_db_path}?mode=ro", uri=True)
+            range_rows = sc.execute("SELECT mal_id, ep_start, ep_end, filler_type FROM filler_ranges").fetchall()
+            sc.close()
+        except Exception:
+            pass
     conn = _init_service_db(filler_db, "AnimeFillerList", "https://www.animefillerlist.com/shows")
     conn.execute(
         """
@@ -1491,28 +1665,194 @@ def harvest_trakt_anizip_simkl_filler(data_dir, cache_dir, seed_db_path):
         )
         """
     )
-    show_rows = []
-    for p in glob.glob(os.path.join(cache_dir, "afl__show_*.json")):
+    conn.executemany("INSERT OR REPLACE INTO filler_shows VALUES (?,?,?,?)", list(show_rows_map.values()))
+    conn.executemany("INSERT OR REPLACE INTO filler_ranges VALUES (?,?,?,?)", range_rows)
+    _finalize_service_db(conn, len(range_rows) or len(show_rows_map))
+    print(f"[OK] anime_metadata_filler_ranges.db: {len(show_rows_map):,} AnimeFillerList shows, {len(range_rows):,} mapped filler ranges")
+
+
+def _fetch_jikan_anime(mal_id):
+    for base in ("https://api.tenrai.org/v1/anime", "https://api.jikan.moe/v4/anime"):
+        url = f"{base}/{int(mal_id)}"
+        for attempt in range(2):
+            req = urllib.request.Request(
+                url,
+                headers={"Accept": "application/json", "User-Agent": "Otaku-Mapping-DB/2.8 (+https://github.com/RPDevs-Builds/Otaku-Mapping-DB)"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    d = payload.get("data") if isinstance(payload, dict) else None
+                    return d if isinstance(d, dict) and d.get("mal_id") else {}
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                if e.code == 404:
+                    return {}
+                break
+            except Exception:
+                break
+    return None
+
+
+def _write_mal_catalog_db(db_path, mal_by_id):
+    tmp_path = f"{db_path}.tmp"
+    conn = _init_service_db(tmp_path, "MyAnimeList / Jikan v4 API", "https://api.jikan.moe/v4/anime")
+    conn.execute(
+        """
+        CREATE TABLE mal_media (
+            mal_id INTEGER PRIMARY KEY,
+            title TEXT,
+            title_english TEXT,
+            title_japanese TEXT,
+            media_type TEXT,
+            episodes INTEGER,
+            status TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            year INTEGER,
+            anime_season TEXT,
+            score REAL,
+            duration_seconds INTEGER,
+            age_rating TEXT,
+            synopsis TEXT,
+            picture_url TEXT,
+            trailer_yt_id TEXT,
+            genres_csv TEXT,
+            studios_csv TEXT,
+            raw_json TEXT NOT NULL
+        )
+        """
+    )
+    rows = []
+    for mid, d in sorted(mal_by_id.items()):
+        if not isinstance(d, dict) or not d.get("mal_id"):
+            continue
+        aired = d.get("aired") if isinstance(d.get("aired"), dict) else {}
+        sd_raw = str(aired.get("from") or "")[:10]
+        ed_raw = str(aired.get("to") or "")[:10]
+        start_date = sd_raw if re.match(r"^\d{4}-\d{2}-\d{2}$", sd_raw) else None
+        end_date = ed_raw if re.match(r"^\d{4}-\d{2}-\d{2}$", ed_raw) else None
+        yr = bm.parse_pos_int(d.get("year")) or (int(start_date[:4]) if start_date else None)
+        if yr and not (1900 <= yr <= 2100):
+            yr = None
+        seas = str(d.get("season") or "").strip().upper() or None
+        if not seas and start_date:
+            m_num = int(start_date[5:7])
+            seas = "WINTER" if m_num in (1, 2, 3) else ("SPRING" if m_num in (4, 5, 6) else ("SUMMER" if m_num in (7, 8, 9) else "FALL"))
+        dur_str = str(d.get("duration") or "")
+        dur_s = None
+        m_hr = re.search(r"(\d+)\s*hr", dur_str)
+        m_min = re.search(r"(\d+)\s*min", dur_str)
+        if m_hr or m_min:
+            dur_s = (int(m_hr.group(1)) if m_hr else 0) * 3600 + (int(m_min.group(1)) if m_min else 0) * 60
+        imgs = ((d.get("images") or {}).get("webp") or (d.get("images") or {}).get("jpg") or {}) if isinstance(d.get("images"), dict) else {}
+        pic = (imgs.get("large_image_url") or imgs.get("image_url") or "").strip() or None
+        tr = d.get("trailer") if isinstance(d.get("trailer"), dict) else {}
+        yt_id = (tr.get("youtube_id") or "").strip() or None
+        genres = ",".join(dict.fromkeys(str(g.get("name")).strip() for g in (d.get("genres") or []) if isinstance(g, dict) and g.get("name"))) or None
+        studios = ",".join(dict.fromkeys(str(s.get("name")).strip() for s in (d.get("studios") or []) if isinstance(s, dict) and s.get("name"))) or None
+        st_raw = str(d.get("status") or "").lower()
+        status = "FINISHED" if "finished" in st_raw else ("ONGOING" if "airing" in st_raw else ("UPCOMING" if "not yet" in st_raw else None))
+        syn = re.sub(r"\s+", " ", str(d.get("synopsis") or "")).strip() or None
+        rows.append((
+            mid,
+            (d.get("title") or "").strip() or None,
+            (d.get("title_english") or "").strip() or None,
+            (d.get("title_japanese") or "").strip() or None,
+            normalize_media_type(d.get("type")),
+            bm.parse_pos_int(d.get("episodes")),
+            status,
+            start_date,
+            end_date,
+            yr,
+            seas,
+            float(d["score"]) if d.get("score") is not None else None,
+            dur_s,
+            (d.get("rating") or "").strip() or None,
+            syn,
+            pic,
+            yt_id,
+            genres,
+            studios,
+            json.dumps(d, ensure_ascii=False),
+        ))
+    conn.executemany("INSERT OR REPLACE INTO mal_media VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    _finalize_service_db(conn, len(rows))
+    os.replace(tmp_path, db_path)
+    print(f"[OK] anime_metadata_mal_catalog.db: {len(rows):,} MAL catalog records", flush=True)
+    return len(rows)
+
+
+def harvest_mal_catalog(data_dir, cache_dir, seed_db_path, max_items=1200):
+    """Harvest MAL-only anime entries missing from AniList/Kitsu into anime_metadata_mal_catalog.db."""
+    db_path = os.path.join(data_dir, "anime_metadata_mal_catalog.db")
+    mal_by_id = {}
+    if os.path.isfile(db_path):
+        try:
+            c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            for (raw_json,) in c.execute("SELECT raw_json FROM mal_media WHERE raw_json IS NOT NULL"):
+                d = json.loads(raw_json)
+                if isinstance(d, dict) and d.get("mal_id"):
+                    mal_by_id[int(d["mal_id"])] = d
+            c.close()
+        except Exception:
+            pass
+    for p in glob.glob(os.path.join(cache_dir, "jikan__*.json")):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 d = (json.load(f) or {}).get("data")
-            if isinstance(d, dict) and d.get("episodes"):
-                slug = d.get("slug") or os.path.basename(p).split("__show_", 1)[1].rsplit(".", 1)[0]
-                show_rows.append((slug, d.get("title"), bm.parse_pos_int(d.get("max_ep")), json.dumps(d.get("episodes"), ensure_ascii=False)))
+            if isinstance(d, dict) and d.get("mal_id"):
+                mal_by_id[int(d["mal_id"])] = d
         except Exception:
             pass
-    range_rows = []
+
+    covered = set()
+    for svc_db, tbl in (("anime_metadata_anilist_catalog.db", "anilist_media"), ("anime_metadata_kitsu_catalog.db", "kitsu_media")):
+        sp = os.path.join(data_dir, svc_db)
+        if os.path.isfile(sp):
+            try:
+                sc = sqlite3.connect(f"file:{sp}?mode=ro", uri=True)
+                for (mid,) in sc.execute(f"SELECT mal_id FROM {tbl} WHERE mal_id IS NOT NULL AND start_date IS NOT NULL"):
+                    covered.add(int(mid))
+                sc.close()
+            except Exception:
+                pass
+
+    priority_mids = []
     if seed_db_path and os.path.isfile(seed_db_path):
         try:
             sc = sqlite3.connect(f"file:{seed_db_path}?mode=ro", uri=True)
-            range_rows = sc.execute("SELECT mal_id, ep_start, ep_end, filler_type FROM filler_ranges").fetchall()
+            cols = {r[1] for r in sc.execute("PRAGMA table_info(anime)")}
+            sd_col = "start_date" if "start_date" in cols else "NULL"
+            for mid, sd, yr in sc.execute(f"SELECT mal_id, {sd_col}, year FROM anime"):
+                if mid and int(mid) not in mal_by_id and (not sd or not yr or int(mid) not in covered):
+                    priority_mids.append((0 if (not sd or not yr) else 1, int(mid)))
             sc.close()
         except Exception:
             pass
-    conn.executemany("INSERT OR REPLACE INTO filler_shows VALUES (?,?,?,?)", show_rows)
-    conn.executemany("INSERT OR REPLACE INTO filler_ranges VALUES (?,?,?,?)", range_rows)
-    _finalize_service_db(conn, len(range_rows) or len(show_rows))
-    print(f"[OK] anime_metadata_filler_ranges.db: {len(show_rows):,} cached AnimeFillerList shows, {len(range_rows):,} mapped filler ranges")
+    priority_mids.sort()
+    cache = bm.ApiCache(cache_dir)
+    to_fetch = [
+        mid for _, mid in priority_mids
+        if cache.get("jikan", mid, max_age_seconds=30 * 86400) != {}
+    ][:max_items]
+
+    if to_fetch:
+        print(f"[MAL Catalog] Fetching {len(to_fetch):,} MAL-only entries from Tenrai/Jikan...", flush=True)
+        for idx, mid in enumerate(to_fetch, start=1):
+            d = _fetch_jikan_anime(mid)
+            if d is not None:
+                cache.set("jikan", mid, d)
+                if d:
+                    mal_by_id[mid] = d
+            if idx % 100 == 0:
+                print(f"  [MAL Catalog {idx}/{len(to_fetch)}] collected={len(mal_by_id):,}", flush=True)
+                _write_mal_catalog_db(db_path, mal_by_id)
+            time.sleep(0.12)
+
+    return _write_mal_catalog_db(db_path, mal_by_id)
 
 
 KITSU_STATUS_MAP = {
@@ -1686,6 +2026,10 @@ def _write_kitsu_catalog_db(db_path, kitsu_by_id, mal_by_kitsu):
             abbreviated_titles_json TEXT,
             poster_image TEXT,
             age_rating TEXT,
+            age_rating_guide TEXT,
+            synopsis TEXT,
+            banner_image TEXT,
+            trailer_yt_id TEXT,
             raw_json TEXT NOT NULL
         )
         """
@@ -1730,6 +2074,11 @@ def _write_kitsu_catalog_db(db_path, kitsu_by_id, mal_by_kitsu):
         abbr = [str(s).strip() for s in (attrs.get("abbreviatedTitles") or []) if isinstance(s, str) and str(s).strip()]
         poster = attrs.get("posterImage") if isinstance(attrs.get("posterImage"), dict) else {}
         poster_url = (poster.get("large") or poster.get("original") or poster.get("medium") or "").strip() or None
+        cover = attrs.get("coverImage") if isinstance(attrs.get("coverImage"), dict) else {}
+        banner_url = (cover.get("large") or cover.get("original") or cover.get("small") or "").strip() or None
+        syn_raw = str(attrs.get("synopsis") or attrs.get("description") or "").strip()
+        synopsis = re.sub(r"\s+", " ", syn_raw).strip() or None
+        yt_id = (attrs.get("youtubeVideoId") or "").strip() or None
 
         rows.append((
             kid,
@@ -1755,9 +2104,13 @@ def _write_kitsu_catalog_db(db_path, kitsu_by_id, mal_by_kitsu):
             json.dumps(abbr, ensure_ascii=False) if abbr else None,
             poster_url,
             (attrs.get("ageRating") or "").strip() or None,
+            (attrs.get("ageRatingGuide") or "").strip() or None,
+            synopsis,
+            banner_url,
+            yt_id,
             json.dumps(obj, ensure_ascii=False),
         ))
-    conn.executemany("INSERT OR REPLACE INTO kitsu_media VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.executemany("INSERT OR REPLACE INTO kitsu_media VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     conn.execute("CREATE INDEX idx_kitsu_mal ON kitsu_media(mal_id) WHERE mal_id IS NOT NULL")
     _finalize_service_db(conn, len(rows))
     os.replace(tmp_path, db_path)
@@ -1772,12 +2125,19 @@ def main():
     parser.add_argument("--seed", default="dist/anime_mappings.db", help="Seed DB for verified historical Trakt/Simkl IDs")
     parser.add_argument("--max-anilist-batches", type=int, default=200, help="Max 250-ID AniList GraphQL batches per run")
     parser.add_argument("--max-kitsu-batches", type=int, default=180, help="Max 20-ID Kitsu Edge API batches per run")
+    parser.add_argument("--max-anizip-items", type=int, default=600, help="Max live AniZip lookups per run")
+    parser.add_argument("--max-mal-items", type=int, default=1200, help="Max live Jikan/MAL catalog lookups per run")
+    parser.add_argument("--skip-live-filler", action="store_true", help="Skip live AnimeFillerList /shows crawl")
     parser.add_argument("--only-anilist", action="store_true", help="Only run AniList catalog harvester")
     parser.add_argument("--only-kitsu", action="store_true", help="Only run Kitsu catalog harvester")
+    parser.add_argument("--only-mal", action="store_true", help="Only run MAL catalog harvester")
     args = parser.parse_args()
 
     if args.only_kitsu:
         harvest_kitsu_catalog(args.data_dir, args.cache_dir, args.seed, max_http_batches=args.max_kitsu_batches)
+        return 0
+    if args.only_mal:
+        harvest_mal_catalog(args.data_dir, args.cache_dir, args.seed, max_items=args.max_mal_items)
         return 0
     if not args.only_anilist:
         harvest_fribb(args.data_dir, args.cache_dir)
@@ -1788,8 +2148,15 @@ def main():
         harvest_wikidata(args.data_dir, args.cache_dir)
         harvest_mal_dubs(args.data_dir, args.cache_dir)
         harvest_anidb_titles(args.data_dir, args.cache_dir)
-        harvest_trakt_anizip_simkl_filler(args.data_dir, args.cache_dir, args.seed)
         harvest_kitsu_catalog(args.data_dir, args.cache_dir, args.seed, max_http_batches=args.max_kitsu_batches)
+        harvest_trakt_anizip_simkl_filler(
+            args.data_dir,
+            args.cache_dir,
+            args.seed,
+            max_anizip_items=args.max_anizip_items,
+            fetch_live_filler=not args.skip_live_filler,
+        )
+        harvest_mal_catalog(args.data_dir, args.cache_dir, args.seed, max_items=args.max_mal_items)
     harvest_anilist_catalog(args.data_dir, args.cache_dir, args.seed, max_http_batches=args.max_anilist_batches)
     return 0
 

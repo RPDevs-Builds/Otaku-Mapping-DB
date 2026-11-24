@@ -81,12 +81,14 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     anibridge_by_anilist = {}
     anibridge_by_anidb = {}
     anibridge_rules = []
+    anibridge_tmdb_rules = []
     anibridge_sec_rules = collections.defaultdict(list)
     wikidata_by_mal = {}
     wikidata_by_anilist = {}
     wikidata_by_anidb = {}
     wikidata_by_kitsu = {}
     dubs_set = set()
+    dubs_status_map = {}
     trakt_by_mal = {}
     anizip_by_mal = {}
     simkl_by_mal = {}
@@ -95,6 +97,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     anilist_relations = []
     kitsu_by_mal = {}
     kitsu_by_kid = {}
+    mal_by_id = {}
     anidb_titles_by_aid = {}
     animelists_by_aid = {}
     animelists_mappings_by_aid = collections.defaultdict(list)
@@ -186,6 +189,13 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
                 anibridge_sec_rules[(sd["source_provider"], sd["source_id"])].append(sd)
         except sqlite3.OperationalError:
             pass
+        try:
+            cur4 = c.execute("SELECT * FROM anibridge_tmdb_rules")
+            tcols = [d[0] for d in cur4.description]
+            for r in cur4.fetchall():
+                anibridge_tmdb_rules.append(dict(zip(tcols, r)))
+        except sqlite3.OperationalError:
+            pass
         c.close()
 
     # Load Wikidata
@@ -216,9 +226,17 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     p = os.path.join(data_dir, "anime_metadata_mal_dubs.db")
     if os.path.isfile(p):
         c = _ro_conn(p)
-        rows = c.execute("SELECT mal_id FROM mal_dubs").fetchall()
+        cols = {r[1] for r in c.execute("PRAGMA table_info(mal_dubs)")}
+        if "is_incomplete" in cols:
+            rows = c.execute("SELECT mal_id, is_incomplete FROM mal_dubs").fetchall()
+            for mid, inc in rows:
+                dubs_set.add(mid)
+                dubs_status_map[mid] = "INCOMPLETE" if inc else "COMPLETE"
+        else:
+            rows = c.execute("SELECT mal_id FROM mal_dubs").fetchall()
+            dubs_set = {r[0] for r in rows}
+            dubs_status_map = {r[0]: "COMPLETE" for r in rows}
         service_counts["mal_dubs"] = len(rows)
-        dubs_set = {r[0] for r in rows}
         c.close()
 
     # Load Anime-Lists XML
@@ -305,6 +323,20 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
                 kitsu_by_mal[d["mal_id"]] = d
         c.close()
 
+    # Load MAL Catalog
+    p = os.path.join(data_dir, "anime_metadata_mal_catalog.db")
+    if os.path.isfile(p):
+        c = _ro_conn(p)
+        cur = c.execute("SELECT * FROM mal_media")
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        service_counts["mal_catalog"] = len(rows)
+        for r in rows:
+            d = dict(zip(cols, r))
+            if d.get("mal_id"):
+                mal_by_id[int(d["mal_id"])] = d
+        c.close()
+
     # 2. Build the complete universe of MAL IDs from active sources + seed
     all_mal_ids = sorted(
         seed_ids
@@ -314,6 +346,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         | set(anibridge_by_mal.keys())
         | set(wikidata_by_mal.keys())
         | set(anilist_by_mal.keys())
+        | set(mal_by_id.keys())
         | set(trakt_by_mal.keys())
         | set(anizip_by_mal.keys())
         | set(simkl_by_mal.keys())
@@ -446,6 +479,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     ep_counts = {}
     schedule_ids = {}
     aliases_map = {}
+    rich_meta = {}
 
     for mid, rec in records.items():
         s_rec = seed_records.get(mid) or {}
@@ -471,6 +505,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         )
         al_rec = (anilist_by_alid.get(al_id) if al_id else None) or anilist_by_mal.get(mid) or {}
         kt_rec = (kitsu_by_kid.get(kit_id) if kit_id else None) or kitsu_by_mal.get(mid) or {}
+        ml_rec = mal_by_id.get(mid) or {}
         az_rec = anizip_by_mal.get(mid) or {}
         sm_rec = simkl_by_mal.get(mid) or {}
         sm_api = sm_rec if sm_rec.get("source") == "simkl_api" else {}
@@ -484,15 +519,21 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         if not adb_t:
             adb_t = {}
 
-        # Schedule IDs (ARM + Wikidata)
+        # Schedule & Extended External IDs (ARM + Wikidata + Fribb + AniZip)
         annict_id = a_rec.get("annict_id") or w_rec.get("annict_id")
         syobocal_tid = a_rec.get("syobocal_tid") or w_rec.get("syobocal_tid")
-        if annict_id or syobocal_tid:
-            schedule_ids[mid] = (annict_id, syobocal_tid)
+        livechart_id = f_rec.get("livechart_id") or az_rec.get("livechart_id")
+        anisearch_id = f_rec.get("anisearch_id")
+        anime_planet_id = f_rec.get("anime_planet_id")
+        ann_id = f_rec.get("animenewsnetwork_id")
+        ac_id = f_rec.get("animecountdown_id")
+        if any(x is not None and x != "" for x in (syobocal_tid, annict_id, livechart_id, anisearch_id, anime_planet_id, ann_id, ac_id)):
+            schedule_ids[mid] = (syobocal_tid, annict_id, livechart_id, anisearch_id, anime_planet_id, ann_id, ac_id)
 
         # Media Type
         mtype, mtype_src, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("format")),
+            ("mal_catalog", 4.5, ml_rec.get("media_type")),
             ("kitsu_api", 4.0, kt_rec.get("subtype")),
             ("fribb", 3.5, f_rec.get("media_type")),
             ("simkl", 3.0, sm_api.get("media_type")),
@@ -503,6 +544,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         # Episodes, Status, Duration, Year, Season, Start Date, Genres, Studios, Picture
         eps, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("episodes")),
+            ("mal_catalog", 4.5, ml_rec.get("episodes")),
             ("kitsu_api", 4.0, kt_rec.get("episodes")),
             ("anizip", 3.5, az_rec.get("episode_count")),
             ("simkl", 3.0, sm_api.get("total_episodes")),
@@ -526,6 +568,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         status_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("status")),
+            ("mal_catalog", 4.5, ml_rec.get("status")),
             ("kitsu_api", 4.0, kt_rec.get("status")),
             ("seed", 2.0, s_rec.get("status")),
         ])
@@ -534,6 +577,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         dur_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("duration_seconds")),
+            ("mal_catalog", 4.5, ml_rec.get("duration_seconds")),
             ("kitsu_api", 4.0, kt_rec.get("duration_seconds")),
             ("seed", 2.0, s_rec.get("duration")),
         ])
@@ -542,6 +586,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         year_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("year")),
+            ("mal_catalog", 4.5, ml_rec.get("year")),
             ("kitsu_api", 4.0, kt_rec.get("year")),
             ("simkl", 3.0, sm_api.get("year")),
             ("seed", 2.0, s_rec.get("year")),
@@ -551,6 +596,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         season_val, _, _ = _pick_consensus([
             ("anilist_graphql", 5.0, al_rec.get("season")),
+            ("mal_catalog", 4.5, ml_rec.get("anime_season")),
             ("kitsu_api", 4.0, kt_rec.get("anime_season")),
             ("seed", 2.0, s_rec.get("anime_season")),
         ])
@@ -560,6 +606,9 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
         if al_rec.get("start_date"):
             rec["start_date"] = al_rec["start_date"]
             provenance[mid]["start_date"] = "anilist_graphql"
+        elif ml_rec.get("start_date"):
+            rec["start_date"] = ml_rec["start_date"]
+            provenance[mid]["start_date"] = "mal_catalog"
         elif kt_rec.get("start_date"):
             rec["start_date"] = kt_rec["start_date"]
             provenance[mid]["start_date"] = "kitsu_api"
@@ -574,26 +623,54 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             rec["start_date"] = f"{int(rec['year']):04d}-{s_month:02d}-01"
             provenance[mid]["start_date"] = "year_season_derived"
 
+        if not rec.get("score") and ml_rec.get("score"):
+            rec["score"] = ml_rec["score"]
+
         if al_rec.get("genres_csv"):
             rec["genres"] = al_rec["genres_csv"]
+        elif ml_rec.get("genres_csv"):
+            rec["genres"] = ml_rec["genres_csv"]
         elif sm_api.get("genres_csv"):
             rec["genres"] = sm_api["genres_csv"]
 
         if al_rec.get("studios_csv"):
             rec["studios"] = al_rec["studios_csv"]
+        elif ml_rec.get("studios_csv"):
+            rec["studios"] = ml_rec["studios_csv"]
         elif sm_api.get("studios_csv"):
             rec["studios"] = sm_api["studios_csv"]
 
         if not rec.get("mal_picture"):
             rec["mal_picture"] = (
-                al_rec.get("cover_image_large")
+                ml_rec.get("picture_url")
+                or al_rec.get("cover_image_large")
                 or al_rec.get("cover_image_medium")
                 or kt_rec.get("poster_image")
             )
 
+        # Rich Metadata for dist/anime_metadata.db (100% consumption of Tier-1 columns)
+        t_native = al_rec.get("title_native") or ml_rec.get("title_japanese") or kt_rec.get("title_ja") or adb_t.get("official_ja")
+        end_date = al_rec.get("end_date") or ml_rec.get("end_date") or kt_rec.get("end_date")
+        synopsis = al_rec.get("synopsis") or ml_rec.get("synopsis") or kt_rec.get("synopsis")
+        age_rating = ml_rec.get("age_rating") or kt_rec.get("age_rating")
+        banner_image = al_rec.get("banner_image") or kt_rec.get("banner_image")
+        trailer_yt_id = al_rec.get("trailer_yt_id") or ml_rec.get("trailer_yt_id") or kt_rec.get("trailer_yt_id")
+        country_origin = al_rec.get("country_of_origin")
+        rich_meta[mid] = {
+            "title_native": t_native,
+            "end_date": end_date,
+            "synopsis": synopsis,
+            "age_rating": age_rating,
+            "banner_image": banner_image,
+            "trailer_yt_id": trailer_yt_id,
+            "country_of_origin": country_origin,
+            "dub_status": dubs_status_map.get(mid),
+        }
+
         # Titles & English Title
         title_main, _, _ = _pick_consensus([
             ("seed", 4.5, s_rec.get("mal_title") if s_rec.get("mal_title") and not str(s_rec.get("mal_title")).startswith("Anime #") else None),
+            ("mal_catalog", 4.3, ml_rec.get("title")),
             ("anilist_romaji", 4.0, al_rec.get("title_romaji")),
             ("kitsu_romaji", 3.8, kt_rec.get("title_romaji") or kt_rec.get("canonical_title")),
             ("anidb_main", 3.5, adb_t.get("main_title")),
@@ -606,6 +683,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
 
         title_en, en_src, _ = _pick_consensus([
             ("anilist_en", 5.0, al_rec.get("title_english")),
+            ("mal_catalog_en", 4.7, ml_rec.get("title_english")),
             ("anidb_official_en", 4.5, adb_t.get("official_en")),
             ("kitsu_en", 4.0, kt_rec.get("title_en")),
             ("simkl_en", 3.5, sm_api.get("title_en")),
@@ -970,6 +1048,27 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
                     "source": "anime_lists_xml",
                 })
 
+    # Fallback TMDB range rules for shows with no TVDB rules
+    tvdb_rule_mids = {rl["mal_id"] for rl in all_rules}
+    for rl in anibridge_tmdb_rules:
+        mid = rl["mal_id"]
+        if mid not in records or mid in tvdb_rule_mids:
+            continue
+        if records[mid].get("thetvdb_id"):
+            continue
+        all_rules.append({
+            "mal_id": mid,
+            "tvdb_id": None,
+            "season": rl["season"],
+            "part": rl["part"],
+            "rule_type": rl["rule_type"],
+            "range_start": rl["range_start"],
+            "range_end": rl["range_end"],
+            "ep_start": rl["ep_start"],
+            "absolute_start": None,
+            "source": "anibridge_v3_tmdb",
+        })
+
     # 5. Map Filler Ranges using full pre-trimmed aliases & complete SEQUEL chains
     cache = bm.ApiCache(".cache")
     filler_ranges, filler_shows = bm.hydrate_and_map_filler_ranges(
@@ -1005,7 +1104,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
             slim_aliases[(mid, norm)] = (clean_t, ttype)
 
     franchise_links = {k: v for k, v in franchise_links.items() if k[0] in records and k[1] in records and k[0] != k[1]}
-    schedule_ids = {k: v for k, v in schedule_ids.items() if k in records and (v[0] or v[1])}
+    schedule_ids = {k: v for k, v in schedule_ids.items() if k in records and any(x is not None and x != "" for x in v)}
     filler_ranges = [r for r in filler_ranges if r[0] in records]
 
     stats = bm.compute_stats(records)
@@ -1024,7 +1123,7 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     # 6. Build Comprehensive Correlated dist/anime_metadata.db
     if output_metadata_path:
         _write_correlated_metadata_db(
-            output_metadata_path, records, aliases_map, franchise_links, filler_ranges, provenance
+            output_metadata_path, records, aliases_map, franchise_links, filler_ranges, provenance, rich_meta, schedule_ids
         )
 
     # 7. Compress & Write Manifest + Correlation Report
@@ -1144,11 +1243,14 @@ def correlate_all_services(data_dir, seed_path, output_mappings_path, output_met
     return report
 
 
-def _write_correlated_metadata_db(db_path, records, full_aliases_map, franchise_links, filler_ranges, provenance):
+def _write_correlated_metadata_db(db_path, records, full_aliases_map, franchise_links, filler_ranges, provenance, rich_meta=None, schedule_ids=None):
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     if os.path.exists(db_path):
         os.remove(db_path)
+    rich_meta = rich_meta or {}
+    schedule_ids = schedule_ids or {}
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA page_size = 4096")
     conn.execute("PRAGMA journal_mode=OFF")
     conn.execute("PRAGMA synchronous=OFF")
     conn.execute(
@@ -1157,18 +1259,51 @@ def _write_correlated_metadata_db(db_path, records, full_aliases_map, franchise_
             mal_id INTEGER PRIMARY KEY,
             mal_title TEXT NOT NULL,
             title_english TEXT,
+            title_native TEXT,
             mal_picture TEXT,
             anime_media_type TEXT NOT NULL,
             global_media_type TEXT NOT NULL,
             status TEXT,
             episodes INTEGER,
             duration INTEGER,
+            score REAL,
             year INTEGER,
             anime_season TEXT,
             start_date TEXT,
+            end_date TEXT,
             genres TEXT,
             studios TEXT,
+            synopsis TEXT,
+            age_rating TEXT,
+            banner_image TEXT,
+            trailer_yt_id TEXT,
+            country_of_origin TEXT,
+            dub_status TEXT,
             provenance_json TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE external_ids (
+            mal_id INTEGER PRIMARY KEY,
+            mal_dub_id INTEGER,
+            anilist_id INTEGER,
+            kitsu_id INTEGER,
+            anidb_id INTEGER,
+            simkl_id INTEGER,
+            thetvdb_id INTEGER,
+            themoviedb_id INTEGER,
+            imdb_id TEXT,
+            trakt_id INTEGER,
+            trakt_slug TEXT,
+            syobocal_tid INTEGER,
+            annict_id INTEGER,
+            livechart_id INTEGER,
+            anisearch_id INTEGER,
+            anime_planet_id TEXT,
+            animenewsnetwork_id INTEGER,
+            animecountdown_id INTEGER
         )
         """
     )
@@ -1185,6 +1320,17 @@ def _write_correlated_metadata_db(db_path, records, full_aliases_map, franchise_
     )
     conn.execute(
         """
+        CREATE TABLE franchise_links (
+            mal_id INTEGER NOT NULL,
+            related_mal_id INTEGER NOT NULL,
+            relation_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (mal_id, related_mal_id, relation_type)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE filler_ranges (
             mal_id INTEGER NOT NULL,
             ep_start INTEGER NOT NULL,
@@ -1194,40 +1340,130 @@ def _write_correlated_metadata_db(db_path, records, full_aliases_map, franchise_
         )
         """
     )
+    conn.execute("CREATE TABLE build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
     meta_rows = []
+    ext_rows = []
+    synopsis_count = 0
     for mid, r in sorted(records.items()):
+        rm = rich_meta.get(mid) or {}
+        syn = rm.get("synopsis")
+        if syn:
+            synopsis_count += 1
         meta_rows.append((
             mid,
             r.get("mal_title") or f"Anime #{mid}",
             r.get("title_english"),
+            rm.get("title_native"),
             r.get("mal_picture"),
             r.get("anime_media_type") or "TV",
             r.get("global_media_type") or "show",
             r.get("status"),
             r.get("episodes"),
             r.get("duration"),
+            r.get("score"),
             r.get("year"),
             r.get("anime_season"),
             r.get("start_date"),
+            rm.get("end_date"),
             r.get("genres"),
             r.get("studios"),
+            syn,
+            rm.get("age_rating"),
+            rm.get("banner_image"),
+            rm.get("trailer_yt_id"),
+            rm.get("country_of_origin"),
+            rm.get("dub_status"),
             json.dumps(provenance.get(mid) or {}, ensure_ascii=False),
         ))
-    conn.executemany("INSERT INTO anime_metadata VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", meta_rows)
+        sc = schedule_ids.get(mid) or (None, None, None, None, None, None, None)
+        ext_rows.append((
+            mid,
+            r.get("mal_dub_id"),
+            r.get("anilist_id"),
+            r.get("kitsu_id"),
+            r.get("anidb_id"),
+            r.get("simkl_id"),
+            r.get("thetvdb_id"),
+            r.get("themoviedb_id"),
+            r.get("imdb_id"),
+            r.get("trakt_id"),
+            r.get("trakt_slug"),
+            sc[0],
+            sc[1],
+            sc[2],
+            sc[3],
+            sc[4],
+            sc[5],
+            sc[6],
+        ))
+    conn.executemany("INSERT INTO anime_metadata VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", meta_rows)
+    conn.executemany("INSERT INTO external_ids VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ext_rows)
     alias_rows = [
         (mid, val[0], norm, val[1])
         for (mid, norm), val in sorted(full_aliases_map.items())
         if mid in records
     ]
     conn.executemany("INSERT OR IGNORE INTO anime_aliases VALUES (?,?,?,?)", alias_rows)
+    link_rows = [
+        (mid, rel_mid, rtype, src)
+        for (mid, rel_mid, rtype), src in sorted((franchise_links or {}).items())
+        if mid in records and rel_mid in records and mid != rel_mid
+    ]
+    conn.executemany("INSERT OR IGNORE INTO franchise_links VALUES (?,?,?,?)", link_rows)
     conn.executemany("INSERT OR IGNORE INTO filler_ranges VALUES (?,?,?,?)", filler_ranges)
+
     conn.execute("CREATE INDEX idx_meta_year_season ON anime_metadata(year, anime_season)")
     conn.execute("CREATE INDEX idx_meta_aliases_norm ON anime_aliases(alias_norm)")
+    conn.execute("CREATE INDEX idx_meta_aliases_mal ON anime_aliases(mal_id)")
+    conn.execute("CREATE INDEX idx_ext_anilist ON external_ids(anilist_id) WHERE anilist_id IS NOT NULL")
+    conn.execute("CREATE INDEX idx_ext_tvdb ON external_ids(thetvdb_id) WHERE thetvdb_id IS NOT NULL")
+    conn.execute("CREATE INDEX idx_ext_livechart ON external_ids(livechart_id) WHERE livechart_id IS NOT NULL")
+
+    # Build FTS5 search index across romaji, english, native, and all multilingual aliases
+    conn.execute(
+        "CREATE VIRTUAL TABLE metadata_fts USING fts5("
+        "mal_title, title_english, title_native, aliases_text, "
+        "content='', tokenize='unicode61 remove_diacritics 2')"
+    )
+    aliases_by_mid = collections.defaultdict(list)
+    for mid, alias_str, _norm, _stype in alias_rows:
+        aliases_by_mid[mid].append(alias_str)
+    fts_rows = [
+        (
+            mid,
+            records[mid].get("mal_title") or "",
+            records[mid].get("title_english") or "",
+            (rich_meta.get(mid) or {}).get("title_native") or "",
+            " | ".join(aliases_by_mid.get(mid, ())),
+        )
+        for mid in sorted(records.keys())
+    ]
+    if fts_rows:
+        conn.executemany(
+            "INSERT INTO metadata_fts (rowid, mal_title, title_english, title_native, aliases_text) VALUES (?, ?, ?, ?, ?)",
+            fts_rows,
+        )
+        conn.execute("INSERT INTO metadata_fts(metadata_fts) VALUES('optimize')")
+
+    conn.executemany(
+        "INSERT INTO build_meta (key, value) VALUES (?, ?)",
+        [
+            ("schema_version", bm.SCHEMA_VERSION),
+            ("built_at_utc", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+            ("row_count", str(len(meta_rows))),
+            ("alias_count", str(len(alias_rows))),
+            ("external_id_count", str(len(ext_rows))),
+            ("franchise_link_count", str(len(link_rows))),
+            ("filler_range_count", str(len(filler_ranges))),
+            ("synopsis_count", str(synopsis_count)),
+        ],
+    )
     conn.commit()
     conn.execute("ANALYZE")
     conn.execute("VACUUM")
     conn.close()
-    print(f"[OK] Built comprehensive correlated metadata DB: {db_path} ({os.path.getsize(db_path):,} bytes, {len(alias_rows):,} aliases)")
+    print(f"[OK] Built comprehensive correlated metadata DB: {db_path} ({os.path.getsize(db_path):,} bytes, {len(alias_rows):,} aliases, {synopsis_count:,} synopses)")
 
 
 def main():

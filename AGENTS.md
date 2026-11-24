@@ -35,7 +35,7 @@
   - `manami-project/anime-offline-database` — Archived on `2026-07-04` (read-only at release `2026-27`). Never use as a primary source for catalog discovery or volatile metadata.
   - `eliasbenb/PlexAniBridge-Mappings` — Archived on `2026-04-05`. Replaced by its active official v3 successor **`anibridge/anibridge-mappings`** (`https://github.com/anibridge/anibridge-mappings/releases/tag/v3`).
   - `MALSync/MAL-Sync-Backup` (GitHub raw) — Dead (`HTTP 451` DMCA takedown). Use `anibridge/anibridge-mappings` v3, `Anime-Lists/anime-lists` XML, and live `api.ani.zip` / `api.malsync.moe`.
-- **Approved Active Sources (14 Per-Service Databases)**:
+- **Approved Active Sources (15 Per-Service Databases)**:
   1. **AniList GraphQL API** (`https://graphql.anilist.co` — 50/page x 5-alias batching via `id_in` and `idMal_in`) -> `data/anime_metadata_anilist_catalog.db`
   2. **Kitsu Edge API** (`https://kitsu.app/api/edge/anime?page[limit]=20&include=mappings`) -> `data/anime_metadata_kitsu_catalog.db`
   3. **AniBridge Mappings v3** (`https://github.com/anibridge/anibridge-mappings/releases/download/v3/mappings.min.json`) -> `data/anime_metadata_anibridge_mappings.db`
@@ -50,6 +50,7 @@
   12. **Trakt API** (`https://api.trakt.tv`) -> `data/anime_metadata_trakt_ids.db`
   13. **AnimeFillerList** (`https://www.animefillerlist.com/shows`) -> `data/anime_metadata_filler_ranges.db`
   14. **AniZip API** (`https://api.ani.zip/mappings`) -> `data/anime_metadata_anizip_mappings.db`
+  15. **MyAnimeList / Tenrai / Jikan v4** (`https://api.tenrai.org/v1/anime`) -> `data/anime_metadata_mal_catalog.db`
 
 ## 3. Three-Tier Database Separation & Provenance Architecture
 - **Tier 1 — Standalone Per-Service Databases (`data/anime_metadata_<service>_<data>.db`)**:
